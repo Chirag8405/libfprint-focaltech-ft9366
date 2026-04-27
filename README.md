@@ -18,13 +18,14 @@ See [research/BACKGROUND.md](research/BACKGROUND.md) for project context and [re
 - Protocol discovery artifacts are documented.
 - Binary symbol/disassembly baseline is documented.
 - A clean-room source skeleton exists (`src/`) for USB + crypto + FT9366 state flow.
-- Full enroll/verify is not complete until chipid command tuple and key schedule are confirmed from captures.
-- On this development host, installed libfprint does not show obvious external TOD loader symbols/path; this may require an in-tree libfprint integration track in parallel.
+- Runtime confirmation on 2026-04-27 shows this Arch host is already past `No driver found`: `fprintd` is entering a `focaltech:fw9366` path and repeatedly reading chipid `0x0`.
+- Full enroll/verify is not complete until the chipid command tuple, event-status handling, and key schedule are confirmed from captures.
+- The repo is still buildable as a standalone module, but its code should now be treated as Path B oriented: ready to drop into `libfprint/drivers/` when protocol behavior is stable.
 
 ## fprintd Verify Success Rate
 
 Current measured success rate after installation:
-- Not yet claimed (implementation incomplete until chipid handshake and encrypted command sequence are validated).
+- Device claim/discovery is confirmed, but enroll/verify is still blocked by `chipid 0x0` and abnormal interrupt status handling.
 
 This section will be updated with real numbers after end-to-end testing (`fprintd-enroll`, `fprintd-verify`, suspend/resume).
 
@@ -64,6 +65,7 @@ sudo meson install -C build
 
 - Shared object installs to `libfprint-2/tod-1` under your `libdir`.
 - udev rules are installed to your configured udev rules directory.
+- For current host-state confirmation, run `tools/check-runtime-state.sh`.
 - You may need to restart fprintd:
 
 ```bash

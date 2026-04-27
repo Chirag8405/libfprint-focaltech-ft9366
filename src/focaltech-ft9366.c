@@ -7,6 +7,7 @@
 
 #include "focaltech-usb.h"
 
+#include <dlfcn.h>
 #include <gio/gio.h>
 
 typedef struct _FpiDeviceFocaltechFt9366 FpiDeviceFocaltechFt9366;
@@ -40,6 +41,114 @@ const FpIdEntry focaltech_ft9366_id_table[] = {
   { .vid = 0, .pid = 0, .driver_data = 0 }
 };
 
+typedef GUsbDevice *(*FtGetUsbDeviceFunc)(FpDevice *device);
+typedef void (*FtOpenCompleteFunc)(FpDevice *device, GError *error);
+typedef void (*FtCloseCompleteFunc)(FpDevice *device, GError *error);
+typedef void (*FtEnrollCompleteFunc)(FpDevice *device, FpPrint *print, GError *error);
+typedef void (*FtVerifyCompleteFunc)(FpDevice *device, GError *error);
+typedef GError *(*FtDeviceErrorNewFunc)(FpDeviceError error);
+
+static gpointer
+ft9366_lookup_symbol(const gchar *name)
+{
+  return dlsym(RTLD_DEFAULT, name);
+}
+
+static GUsbDevice *
+ft9366_get_usb_device(FpDevice *device)
+{
+  static FtGetUsbDeviceFunc get_usb_device = NULL;
+  static gsize initialized = 0;
+  GUsbDevice *usb = NULL;
+
+  if (g_once_init_enter(&initialized)) {
+    get_usb_device = (FtGetUsbDeviceFunc) ft9366_lookup_symbol("fpi_device_get_usb_device");
+    g_once_init_leave(&initialized, 1);
+  }
+
+  if (get_usb_device != NULL)
+    return get_usb_device(device);
+
+  g_object_get(device, "fpi-usb-device", &usb, NULL);
+  return usb;
+}
+
+static void
+ft9366_open_complete(FpDevice *device, GError *error)
+{
+  static FtOpenCompleteFunc complete = NULL;
+  static gsize initialized = 0;
+
+  if (g_once_init_enter(&initialized)) {
+    complete = (FtOpenCompleteFunc) ft9366_lookup_symbol("fpi_device_open_complete");
+    g_once_init_leave(&initialized, 1);
+  }
+
+  if (complete != NULL)
+    complete(device, error);
+  else
+    g_clear_error(&error);
+}
+
+static void
+ft9366_close_complete(FpDevice *device, GError *error)
+{
+  static FtCloseCompleteFunc complete = NULL;
+  static gsize initialized = 0;
+
+  if (g_once_init_enter(&initialized)) {
+    complete = (FtCloseCompleteFunc) ft9366_lookup_symbol("fpi_device_close_complete");
+    g_once_init_leave(&initialized, 1);
+  }
+
+  if (complete != NULL)
+    complete(device, error);
+  else
+    g_clear_error(&error);
+}
+
+static void
+ft9366_enroll_complete_not_supported(FpDevice *device)
+{
+  static FtEnrollCompleteFunc complete = NULL;
+  static FtDeviceErrorNewFunc device_error_new = NULL;
+  static gsize initialized = 0;
+  g_autoptr(GError) error = NULL;
+
+  if (g_once_init_enter(&initialized)) {
+    complete = (FtEnrollCompleteFunc) ft9366_lookup_symbol("fpi_device_enroll_complete");
+    device_error_new = (FtDeviceErrorNewFunc) ft9366_lookup_symbol("fpi_device_error_new");
+    g_once_init_leave(&initialized, 1);
+  }
+
+  if (complete == NULL || device_error_new == NULL)
+    return;
+
+  error = device_error_new(FP_DEVICE_ERROR_NOT_SUPPORTED);
+  complete(device, NULL, g_steal_pointer(&error));
+}
+
+static void
+ft9366_verify_complete_not_supported(FpDevice *device)
+{
+  static FtVerifyCompleteFunc complete = NULL;
+  static FtDeviceErrorNewFunc device_error_new = NULL;
+  static gsize initialized = 0;
+  g_autoptr(GError) error = NULL;
+
+  if (g_once_init_enter(&initialized)) {
+    complete = (FtVerifyCompleteFunc) ft9366_lookup_symbol("fpi_device_verify_complete");
+    device_error_new = (FtDeviceErrorNewFunc) ft9366_lookup_symbol("fpi_device_error_new");
+    g_once_init_leave(&initialized, 1);
+  }
+
+  if (complete == NULL || device_error_new == NULL)
+    return;
+
+  error = device_error_new(FP_DEVICE_ERROR_NOT_SUPPORTED);
+  complete(device, g_steal_pointer(&error));
+}
+
 static gboolean
 focaltech_ensure_transport(FpiDeviceFocaltechFt9366 *self,
                            FpDevice *device,
@@ -50,8 +159,7 @@ focaltech_ensure_transport(FpiDeviceFocaltechFt9366 *self,
   if (self->transport_initialized)
     return TRUE;
 
-  /* The usb backing object is exposed as an internal construct property. */
-  g_object_get(device, "fpi-usb-device", &usb, NULL);
+  usb = ft9366_get_usb_device(device);
   if (!G_USB_IS_DEVICE(usb)) {
     g_set_error_literal(error,
                         G_IO_ERROR,
@@ -74,8 +182,11 @@ focaltech_open(FpDevice *device)
   if (!focaltech_ensure_transport(self, device, &error) ||
       !ft9366_open(&self->transport, &error)) {
     g_warning("FT9366 open failed: %s", error != NULL ? error->message : "unknown error");
+    ft9366_open_complete(device, g_steal_pointer(&error));
     return;
   }
+
+  ft9366_open_complete(device, NULL);
 }
 
 static void
@@ -84,25 +195,32 @@ focaltech_close(FpDevice *device)
   FpiDeviceFocaltechFt9366 *self = (FpiDeviceFocaltechFt9366 *) device;
   g_autoptr(GError) error = NULL;
 
-  if (!self->transport_initialized)
+  if (!self->transport_initialized) {
+    ft9366_close_complete(device, NULL);
     return;
+  }
 
   if (!ft9366_close(&self->transport, &error)) {
     g_warning("FT9366 close failed: %s", error != NULL ? error->message : "unknown error");
+    ft9366_close_complete(device, g_steal_pointer(&error));
     return;
   }
+
+  ft9366_close_complete(device, NULL);
 }
 
 static void
 focaltech_enroll(FpDevice *device)
 {
   g_warning("FT9366 enroll callback invoked but enroll flow is not implemented yet");
+  ft9366_enroll_complete_not_supported(device);
 }
 
 static void
 focaltech_verify(FpDevice *device)
 {
   g_warning("FT9366 verify callback invoked but verify flow is not implemented yet");
+  ft9366_verify_complete_not_supported(device);
 }
 
 static void

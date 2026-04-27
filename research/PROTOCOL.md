@@ -1,7 +1,7 @@
 # FT9366 Protocol Notes (USB 2808:a658)
 
 Status: in progress
-Last updated: 2026-04-26
+Last updated: 2026-04-27
 
 ## Scope
 This document tracks concrete protocol findings for the FocalTech FT9366 sensor behind Realtek bridge (USB 2808:a658), with emphasis on the chipid handshake and encrypted command channel.
@@ -10,10 +10,13 @@ This document tracks concrete protocol findings for the FocalTech FT9366 sensor 
 
 ### Attempted in this environment
 - Device is present: `ID 2808:a658 Realtek USB2.0 Finger Print Bridge FocalTech Fingerprint Device`.
-- Capture was blocked in this environment due to:
-  - `tcpdump` missing
-  - non-interactive sudo not available (`sudo -n modprobe usbmon` failed)
-  - `/sys/kernel/debug/usb/usbmon` not visible
+- usbmon capture is now working on the target host.
+- Capture files and detailed notes are recorded in:
+  - `research/captures/2026-04-27-usbmon-notes.md`
+  - `/home/chirag/captures/session_1616.pcap`
+  - `/home/chirag/captures/session_timeout_162208.pcap`
+  - `/home/chirag/captures/session_postreset_162749.pcap`
+  - `/home/chirag/captures/session_rebind_162930.pcap`
 
 ### Required on target host (interactive)
 Run on the hardware owner machine with sudo and tcpdump:
@@ -32,6 +35,58 @@ Wireshark filter:
 ```text
 usb.idVendor == 0x2808
 ```
+
+### Confirmed early protocol sequence
+
+The first confirmed non-descriptor command sent to the fingerprint sensor is:
+
+```text
+02 00 01 a5 a4
+```
+
+Observed in captures:
+
+- `session_1616.pcap`: frames `1455` -> `1457`
+- `session_postreset_162749.pcap`: frames `1037` -> `1039`
+- `session_rebind_162930.pcap`: frames `995` -> `997`
+
+Minimal sequence:
+
+```text
+CONTROL OUT ep0      SET_CONFIGURATION (wValue=1)
+BULK OUT   ep0x01    02 00 01 a5 a4
+BULK IN    ep0x82    host waits for response
+```
+
+Current interpretation:
+
+- treat `02 00 01 a5 a4` as `CMD_INIT` / `CMD_WAKE`
+- it is sent before the chipid read path
+- the host then arms bulk IN on `0x82`
+- in all current April 27 captures, the device never returns the expected first response packet
+
+Practical implication:
+
+- the current failure is consistent with the sensor not completing its wake/init handshake
+- because the first response never arrives, later chipid/event traffic is never reached in these sessions
+
+### Reset experiments run on 2026-04-27
+
+Two reset strategies were tested before the fresh enroll attempt:
+
+1. USB authorization toggle on `/sys/bus/usb/devices/3-8/authorized`
+2. USB unbind/rebind via `/sys/bus/usb/drivers/usb/{unbind,bind}`
+
+Observed result:
+
+- both resets restored the device cleanly in `lsusb`
+- both were followed immediately by a single `fprintd-enroll`
+- both still reproduced the same early sequence:
+  - `CMD_INIT/CMD_WAKE` bulk OUT
+  - bulk IN wait on `0x82`
+  - `failed to claim device: Timeout was reached`
+
+This means the reset changes were not sufficient to reproduce the richer April 26 probe state.
 
 ## Method B/C: binary and symbol analysis (completed)
 
@@ -106,6 +161,13 @@ Practical implication:
 ## Command/response table template (to fill after usbmon)
 
 ```text
+CMD_INIT / CMD_WAKE:
+  Transport: bulk OUT
+  Endpoint: 0x01
+  Request bytes: [02 00 01 a5 a4]
+  Expected next step: bulk IN response on endpoint 0x82
+  Current observed result: host waits on 0x82 and times out
+
 CMD_READ_CHIPID:
   bmRequestType: 0xC0
   bRequest: 0x??
@@ -117,7 +179,8 @@ CMD_READ_CHIPID:
 ```
 
 ## Next concrete actions
-1. Capture a full enroll session on target host with usbmon and export control transfer tuples.
-2. Map the transfer tuple used before `_Z17fw9366_chipid_getv` success path.
-3. Locate key material/derivation around `PK11_ImportSymKey` in decompiler (Ghidra/r2) once tools are available.
-4. Build driver state machine around: open -> chipid -> crypto init -> event loop -> enroll/verify.
+1. Reproduce the April 26 cold-start environment: one fresh boot, usbmon started before any fingerprint access, one single enroll attempt.
+2. Capture the first successful response after `CMD_INIT / CMD_WAKE` on bulk IN `0x82`.
+3. Map the command immediately following the first successful wake response and identify where chipid traffic begins.
+4. Locate key material/derivation around `PK11_ImportSymKey` in decompiler (Ghidra/r2) once tools are available.
+5. Build driver state machine around: open -> init/wake -> chipid -> crypto init -> event loop -> enroll/verify.
