@@ -1,0 +1,22 @@
+pkgname=libfprint-focaltech-ft9366
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="libfprint driver work for FocalTech FT9366 fingerprint sensor (USB 2808:a658)"
+arch=('x86_64')
+url="https://github.com/<your-username>/libfprint-focaltech-ft9366"
+license=('LGPL-2.1-or-later')
+depends=('glib2' 'libgusb' 'libfprint' 'nss')
+makedepends=('meson' 'ninja' 'git')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  meson setup build --prefix=/usr --buildtype=release
+  meson compile -C build
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  meson install -C build --destdir="$pkgdir"
+}

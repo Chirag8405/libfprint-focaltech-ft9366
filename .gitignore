@@ -1,0 +1,10 @@
+build/
+*.so
+*.o
+*.a
+*.pcap
+*.pcapng
+*.log
+research/captures/*.txt
+research/captures/*.md
+!.gitkeep

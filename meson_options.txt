@@ -1,0 +1,9 @@
+option('install_udev_rules',
+  type: 'boolean',
+  value: true,
+  description: 'Install FT9366 udev rule')
+
+option('udev_rules_dir',
+  type: 'string',
+  value: '/usr/lib/udev/rules.d',
+  description: 'Destination directory for udev rules')

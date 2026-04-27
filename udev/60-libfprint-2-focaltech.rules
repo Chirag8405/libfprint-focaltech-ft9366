@@ -1,0 +1,6 @@
+# FocalTech FT9366 fingerprint sensor (USB 2808:a658)
+# Grant desktop-session access and keep power management from autosuspending.
+
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="2808", ATTR{idProduct}=="a658", TAG+="uaccess"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2808", ATTR{idProduct}=="a658", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2808", ATTR{idProduct}=="a658", TEST=="power/autosuspend", ATTR{power/autosuspend}="-1"
