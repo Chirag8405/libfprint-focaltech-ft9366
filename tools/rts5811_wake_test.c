@@ -406,7 +406,32 @@ int main(void)
     printf("\n== fw9366_fdt_mode_init() INVOCATION A1 -- corrected, complete for this call path ==\n");
     printf("-- idle_enter() --\n");
     idle_enter(h);
-    printf("-- [NOT CALLED: fw9366_img_mode_init(0) -- untraced, 3074 bytes; REG9366[0x77]==0 so real driver WOULD call this here] --\n");
+
+    /* --- fw9366_img_mode_init(0) -- OPENING traced (0x15b8a9, 3074 bytes
+     * total, ~13% covered). Called here because REG9366[0x77]==0 (confirmed
+     * via fw9366_init_flag). Resolved so far:
+     *   idle_enter()   -- called again internally; harmless to repeat live.
+     *   sram_write(0x1801, sram_bits_set(0xfc80, hi=6,lo=0, new=REG9366[0x87]))
+     *     = sram_write(0x1801, 0xfcb6)  -- REG9366[0x87]=0x36 confirmed via
+     *       fw9366_init_flag (unconditional write, already traced).
+     *     NOTE: this happens BEFORE fdt_mode_init's own 0x1801 write
+     *     (0xfc9b) in the real sequence -- two writes to the same address,
+     *     not one; both must be sent in order for wire-level fidelity, even
+     *     though the second overwrites the first.
+     *   FW9366_LAST_DAC = REG9366[0x87]  -- host-side only, no wire effect.
+     *   if (param==0): sram_write(0x1800, 0x4ffe)   -- FIXED constant, our
+     *       case (param=0), no host-state dependency.
+     *   (param!=0 branch not relevant -- real call always uses param=0 here)
+     * Remaining ~87% of img_mode_init's body NOT yet traced -- stopping
+     * integration at this point, same honest-gap policy as before. */
+    printf("-- img_mode_init(0) opening: idle_enter() again --\n");
+    idle_enter(h);
+    printf("-- img_mode_init(0): sram_write(0x1801, 0xfcb6) [REG9366[0x87]=0x36, happens BEFORE fdt_mode_init's own 0x1801 write] --\n");
+    sram_write(h, 0x1801, 0xfcb6);
+    printf("-- img_mode_init(0): sram_write(0x1800, 0x4ffe) [fixed constant, param==0 branch] --\n");
+    sram_write(h, 0x1800, 0x4ffe);
+    printf("-- [REST OF img_mode_init(0) NOT YET TRACED -- ~87%% remaining] --\n\n");
+
     printf("-- sram_write(0x1801, 0xfc9b) --\n");
     sram_write(h, 0x1801, 0xfc9b);
     printf("-- sram_write(0x180c, 0x0000) [CORRECTED: AUTO_DAC_PRO_FLAG=1 branch, not the ==0 branch] --\n");

@@ -683,3 +683,42 @@ This is now confirmed complete for invocation A1 up to the point `fdt_mode_init`
 `fw9366_context[0xfc]=0xa1` (a host-side-only state write, no wire effect). Still not integrated: the
 `fw9366_img_mode_init(0)` call (which the real sequence makes BEFORE these three writes) and the remaining
 ~60% of `fdt_mode_init`'s body after this point.
+
+## Update: fw9366_img_mode_init opening traced and tested clean (2026-09-16)
+
+Status: CONFIRMED (static disassembly + live hardware test), ~13% of this 3074-byte function covered
+
+### Call-site check (same discipline as fdt_mode_init)
+6 call sites total in the binary. Two are the already-confirmed-unreachable `fw9366_Chip_Paramter_Init` /
+`fw9366_FDT_ESD_Handle`. Three more (`fw9366_img_scan_start`, `fw9366_Special_img_scan_start`,
+`fw9366_GestureStart`) are later-phase scan/gesture entry points, not reachable from the init chain currently
+being traced -- noted, not chased further right now (out of scope until the capture/scan phase). Only the
+call from inside `fdt_mode_init` (param=0, confirmed via `fw9366_init_flag`'s `REG9366[0x77]=0`) is relevant.
+
+### Resolved opening sequence (param=0)
+```
+img_mode_init(0):
+  idle_enter()   -- called again; same primitive, harmless to repeat.
+  sram_write(0x1801, sram_bits_set(0xfc80, hi=6, lo=0, new=REG9366[0x87]))
+    = sram_write(0x1801, 0xfcb6)   -- REG9366[0x87]=0x36 (unconditional write, confirmed via fw9366_init_flag)
+  FW9366_LAST_DAC = REG9366[0x87]   -- host-side only
+  if (param==0): sram_write(0x1800, 0x4ffe)   -- FIXED constant, no host-state dependency (our case)
+```
+
+**Important ordering finding**: this `0x1801` write happens BEFORE `fdt_mode_init`'s own `0x1801` write
+(`0xfc9b`, already confirmed) in the real sequence -- two writes to the same SRAM address with different
+values, not one. Both are now sent in the correct order in `tools/rts5811_wake_test.c`, even though the
+second overwrites the first -- wire-level fidelity to the real sequence, not just final-state correctness.
+
+### Live hardware test result -- all clean, zero timeouts
+```
+sram_write(0x1801, 0xfcb6) -> 05 fa 98 01 00 01 fc b6
+sram_write(0x1800, 0x4ffe) -> 05 fa 98 00 00 01 4f fe
+sram_write(0x1801, 0xfc9b) -> 05 fa 98 01 00 01 fc 9b   (fdt_mode_init's own write, now correctly after)
+sram_write(0x180c, 0x0000) -> 05 fa 98 0c 00 01 00 00
+sram_write(0x1881, 0x0f0c) -> 05 fa 98 81 00 01 0f 0c
+```
+
+Remaining ~87% of `img_mode_init` and ~60% of `fdt_mode_init` (after the point where it calls `img_mode_init`)
+still not traced. Running tally: 5 confirmed sram_write commands now integrated for this portion of the real
+init sequence, all tested clean.
