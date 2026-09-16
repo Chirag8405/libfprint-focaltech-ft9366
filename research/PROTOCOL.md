@@ -1916,3 +1916,81 @@ so -- that empirical check will catch a wrong guess here regardless of how it's 
 next preprocessing stage now; will return to nail this function's exact inner logic with a raw-disassembly
 pass (same method as `FtNonLinearStretch_U8`) before or during the intermediate-value validation pass, not
 skipping it permanently.
+
+## Update: four more preprocessing stages traced (2026-09-16)
+
+Status: CONFIRMED (r2dec first-pass + spot-checked against DWARF-annotated signatures/constants; not yet
+raw-disassembly-verified line-by-line the way FtNonLinearStretch_U8 was, since these four had no genuine
+control-flow ambiguity in the decompiler output -- flagging that distinction honestly)
+
+### f9395_image_enhance(UINT8 *src, SINT32 rows, SINT32 cols)
+```
+n = rows*cols
+buf16 = UINT16[n]; for i: buf16[i] = (uint16)src[i]
+FtImageEnhance_16u_v2(buf16, rows, cols, dst=buf16)     -- 16-bit enhancement, not yet traced internally
+for i: src[i] = (uint8)(src[i]*0.65 + buf16[i]*0.35)    -- weighted blend, confirmed constants sum to 1.0
+```
+
+### FtGrayMeanSub(UINT8 *src, SINT32 rows, SINT32 cols, SINT32 ksize)
+```
+if src==NULL or ksize<=2: return -1
+n = rows*cols; bufA=FP32[n]; bufB=FP32[n]; for i: bufA[i]=bufB[i]=(float)src[i]
+FtBoxFilter_32f(bufA, rows, cols, ksize=3, dst=bufA, normalize=1)        -- fixed small blur
+FtBoxFilter_32f(bufB, rows, cols, ksize=<param>, dst=bufB, normalize=1)  -- caller-specified larger blur
+for i: bufA[i] -= bufB[i]                                                -- DoG-like bandpass, generalized
+FtNormalize_32f_2_8u_constprop_11(bufA, rows, cols, alpha=0.0, beta=254.0, dst=src)  -- IN-PLACE overwrite
+return 0
+```
+`FtBoxFilter_32f` shares the exact signature of the earlier-confirmed `FtImgBoxFilter` -- same shared
+OpenCV-equivalent primitive family, different exported name (likely a compiler/linker artifact of multiple
+translation units using the same static inline or a thin wrapper).
+
+### FtBadPixselDetect(UINT8 *src, UINT16 rows, UINT16 cols, UINT8 *dst) -- produces a MASK, does not correct pixels
+```
+if src==NULL or dst==NULL: return -1
+n = rows*cols
+meanImg = UINT8[n]; FtMeanImage(src, rows, cols, ksize=1, dst=meanImg)   -- local mean filter
+memset(dst, 1, n)
+for each pixel i: if meanImg[i] != 0xff: dst[i] = 0    -- "bad" flag survives only where local mean saturates
+FtErosion(dst, cols, rows, iterations=2)               -- morphological cleanup of the candidate mask
+return 0
+```
+Correction to the earlier pipeline summary: this stage only DETECTS a bad-pixel-cluster mask (regions where the
+local mean is fully saturated at 255, i.e. dead/stuck-high sensor pixel clusters); it does not itself correct
+any pixel values. Not yet confirmed how/whether this mask is consumed downstream (`dst` buffer's later use not
+yet traced -- flagged as open).
+
+### FtLocalContrastEnhance(UINT8 *src, SINT32 rows, SINT32 cols, SINT32 ksize) -- full trace, real constants extracted
+```
+if src==NULL: return -1
+n = rows*cols; bufMean=FP32[n]; bufVar=FP32[n]
+FtGaussianBlur_8u(src, rows, cols, ksize=3, sigma=-1.0(auto), dst=src)    -- IN-PLACE pre-smoothing of src itself
+sum=0
+for i: bufMean[i]=(float)src[i]; bufVar[i]=(float)(src[i]*src[i]); sum+=src[i]
+FtBoxFilter_32f(bufMean, rows, cols, ksize, dst=bufMean, normalize=1)     -- local mean
+FtBoxFilter_32f(bufVar,  rows, cols, ksize, dst=bufVar,  normalize=1)     -- local mean-of-squares
+globalMean = (float)(sum / n)             -- integer division then cast (invariant across pixels)
+GAIN=0.2  FLOOR=1.0  (both CONFIRMED exact float constants extracted from .rodata)
+for i:
+  localVar = bufVar[i] - bufMean[i]^2
+  localStd = (localVar > 0) ? max(sqrt(localVar), FLOOR) : FLOOR
+  gain = (globalMean * GAIN) / localStd
+  bufVar[i] = bufMean[i] + gain*(src[i] - bufMean[i])      -- adaptive contrast-enhanced float value (reuses bufVar)
+(min,max) = min/max over bufVar[0..n-1]
+epsilon = 1e-6 (CONFIRMED exact double constant); guards the (max-min) divide against a near-flat image
+scale = 250.0 / (max-min)                 -- CONFIRMED exact float constant (same 250.0 used elsewhere)
+for i: src[i] = (uint8)((bufVar[i]-min) * scale)   -- final min-max stretch, IN-PLACE overwrite of src
+free bufMean, bufVar
+return 0
+```
+This is a real, describable, standard-ish technique: local-mean/variance-based adaptive gain normalization,
+structurally similar to the classic Hong/Wan/Jain fingerprint image normalization approach from the fingerprint
+enhancement literature (target global statistics blended per-pixel based on local variance) -- not a fully
+bespoke/mystery formula, which is good news for confident reimplementation. All four constants (GAIN=0.2,
+FLOOR=1.0, epsilon=1e-6, SCALE=250.0) were extracted as exact IEEE-754 values from `.rodata`, not estimated.
+
+### Running status of Step 1 (preprocessing chain)
+Traced so far: FtNonLinearStretch_U8 (full), f9395_image_enhance (full, modulo FtImageEnhance_16u_v2 internals),
+FtGrayMeanSub (full), FtBadPixselDetect (full), FtLocalContrastEnhance (full).
+Remaining: FtSegmentByLocalVariance, FtResize_8u, SPA smoothing (InitSPAImageSize/MaskRadius/ImpactFactors +
+FtSpaSmooth), FtGenBinImg/FtGenBinImgForSamllSensor/FtRepairGenBinImgForSamllSensor.
