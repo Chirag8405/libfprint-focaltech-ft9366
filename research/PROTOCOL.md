@@ -3309,3 +3309,70 @@ across two functions plus the glue logic between them) -- flagging the scope exp
 it silently, since there's no guarantee it resolves the separation problem even after full replication (the
 "structural/geometric confound" hypothesis logged earlier remains a live alternative explanation that fuller
 RANSAC fidelity would not fix).
+
+## Synthetic ground-truth diagnostic: rotation handling isolated as the specific weak point (2026-09-16)
+
+Status: CONFIRMED via a purpose-built synthetic-transform diagnostic (`tools/test_synthetic.c`,
+`tools/test_rotation_sweep.c`, both committed as reusable tooling, not throwaway scripts). This directly
+answers the question posed before committing to the expensive two-stage RANSAC disassembly: is the
+match-scoring failure a real bug in the matching code (works fine even on clean synthetic ground truth), or a
+structural limit of the whole approach on this sensor (fails even on clean synthetic ground truth)?
+
+### Method
+Took a real preprocessed capture and generated synthetic "different captures" of the SAME underlying pattern
+via known rigid transforms (translation ±2px, rotation ±3deg, and combinations), using bilinear resampling
+with zero-fill for revealed borders (mimicking what a real shifted capture would look like). Ran the full
+reimplemented pipeline (`focal_extract_features` + `focal_verify_two_templates`) on these pairs, where the
+correct answer is known by construction (same pattern = should score high). Compared against genuinely
+different real captures (`diff1-3.raw`), each with their own synthetic transform variants.
+
+### Result: translation cleanly separates; rotation does not
+```
+same-image, translation only (identity, dx=+-2, dy=+-2):   0.9350 - 0.9723  (n=5)
+same-image, any transform including rotation:                0.8397 - 0.9723  (n=9, avg 0.9076)
+different-image (real different finger + transforms):        0.5661 - 0.9005  (n=27, avg 0.8119)
+```
+**Pure-translation same-image scores (min 0.9350) cleanly separate from ALL different-image scores (max
+0.9005)** -- a real, clean margin. But same-image scores WITH rotation (0.8397-0.8593) fall inside the
+different-image range and are sometimes lower than several genuinely-different-finger scores. This is not
+noise: a fine-grained rotation-only sweep (`test_rotation_sweep`, 0-10 degrees, no translation) on THREE
+independent base images (`same5.raw`, `same1.raw`, `diff2.raw` -- each tested against a synthetic rotated copy
+of itself) shows the same smooth, monotonic degradation in all three cases:
+```
+same5.raw vs itself, rotated:  0deg=0.9723  1deg=0.9091  2deg=0.8793  3deg=0.8525  5deg=0.7915  10deg=0.7537
+same1.raw vs itself, rotated:  0deg=0.9525  1deg=0.8748  2deg=0.8654  3deg=0.7902  5deg=0.7671  10deg=0.6671
+diff2.raw vs itself, rotated:  0deg=0.9708  1deg=0.9080  2deg=0.8656  3deg=0.8417  5deg=0.7764  10deg=0.7349
+```
+By 2-3 degrees of rotation -- well within the range of normal finger-placement variation between two real
+captures -- a PROVABLY identical pattern already scores in the same range as genuinely different fingers.
+Translation of the same magnitude (2px, comparable displacement) barely moves the score (0.93-0.97).
+
+### Honest caveat: the synthetic transform itself is not a perfectly clean probe
+Detected feature counts also grow substantially under synthetic rotation (e.g. same1.raw: 53 features at
+0deg -> 73-77 at 2.5-4deg), which bilinear-resampling interpolation/aliasing artifacts from the synthetic
+rotation itself could partly explain (rotating introduces new sub-pixel edge content that create extra DoG
+extrema), not purely a matching-stage effect. However, this caveat does not undermine the core finding: BOTH
+translation and rotation transforms go through the identical bilinear resampling step, yet translation stays
+robust (0.93-0.97) while rotation degrades sharply (0.75-0.91) -- the asymmetry itself is the signal, and it
+points specifically at rotation/angle handling, not at synthetic-image artifacts in general.
+
+### Interpretation per the pre-registered decision tree
+This is the "mixed but resolvable" case: not a clean full pass (there IS overlap when rotation is included in
+the same-image set) and not a clean full failure (translation-only cleanly separates, so the matching/scoring
+code is not fundamentally broken on clean ground truth). Narrowing further: the overlap is entirely
+attributable to rotation specifically, and this dovetails precisely with the previously-logged architectural
+finding that the real algorithm's matcher has a DEDICATED first-stage `FtRansacAngle_32f` (robust rotation/angle
+consensus, most plausibly a voting/histogram scheme over pairwise orientation differences across ALL
+candidates, not a random-3-point affine sample like this reimplementation's `ransac_affine`) before the
+second-stage `FtRansacEdage_32f`. A dedicated, all-candidate rotation-consensus estimate would plausibly be far
+more robust to a few degrees of rotation than an affine fit whose rotation component is an incidental byproduct
+of a random minimal-sample RANSAC.
+
+### Conclusion: proceed to the two-stage RANSAC disassembly, now justified by evidence
+This resolves the choice posed at the top of this investigation in favor of hypothesis (a) (a real deficiency
+in this reimplementation's matching approach, specifically rotation-consensus estimation) over hypothesis (b)
+(an inherent structural limit of the sensor/approach) -- the clean translation-only separation proves the
+underlying descriptor+scoring signal DOES exist and IS discriminative when alignment is accurate; it is the
+alignment-estimation robustness (specifically to rotation) that is missing. Next step: disassemble
+`FtRansacAngle_32f` (file offset 0xf67b0) specifically, prioritized over `FtRansacEdage_32f`, since the
+symptom isolates cleanly to rotation/angle handling rather than general point-correspondence consensus.
