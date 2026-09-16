@@ -2359,3 +2359,83 @@ than needing to be inferred or approximated. Combined with the OpenSIFT-equivale
 (Step 2) and the already-traced preprocessing chain (Step 1), enough of the algorithm is now understood to
 begin writing an actual C reimplementation, with `FtVerifyTwoTemplate` (matching/scoring, Step 4) as the last
 major untraced piece.
+
+## MILESTONE: FtVerifyTwoTemplate architecture mapped, core scoring formula concretely nailed (2026-09-16)
+
+Status: CONFIRMED for the pieces described (raw disassembly verified precisely for the score formula, since
+it's the single most important detail in the whole matcher); RANSAC outlier-rejection internals and FAR
+threshold calibration NOT traced in full depth (explicit scope decision, see below).
+
+### Call graph (548 basic blocks total -- the largest function in the whole binary; NOT fully linearly traced)
+```
+FtRansacAngle_32f / FtRansacEdage_32f (/_FT9391 variant)   -- RANSAC-style robust correspondence/outlier
+                                                                rejection (90-98 cx each -- large, genuinely
+                                                                complex, NOT traced in depth this pass)
+FtGetAffineTrans_32f                                       -- least-squares affine fit from point
+                                                                correspondences (FULLY TRACED, see below)
+FtHmatrixInv, FtCalcMatrixInfo                             -- transform matrix utilities (not traced)
+FtCalcKpNumInMatchArea, FtCalcConvexHull, FtCalImageOverlap,
+FtGetUniformRegSizeAll(InRect)                             -- area/overlap-based weighting (not traced)
+FtRecallBinCheck, FtCalcBinFeature, getLocalFeature         -- binary-descriptor candidate matching (not traced)
+FtCalcSimScore / FtCalcSimScoreRefit                        -- final score computation (FtCalcSimScore FULLY
+                                                                TRACED, see below; Refit variant not traced)
+FtCheckFAR, FtClassifierCutFar, FtCheckFrList, FtRecallBinCheck  -- security/threshold decision logic (not traced)
+SaveMachScore                                               -- persists score to the earlier-seen gMatchScore/
+                                                                gVerifyScores globals
+```
+
+### FtGetAffineTrans_32f(FP32 *coord1, FP32 *coord2, SINT32 n, FP32 *hMat) -- FULLY TRACED, standard technique
+Builds the classic 6x6 normal-equations system for least-squares 2D AFFINE transform estimation from N point
+correspondences (accumulating sums of x^2, xy, y^2, x, y, 1, x*x', y*x', x', x*y', y*y', y' -- exactly the
+standard terms for solving `x'=a*x+b*y+e; y'=c*x+d*y+f` by least squares), then calls `FtSolve_6x6_32f` to
+solve the resulting system. This is textbook computer-vision math (identical in spirit to OpenCV's
+`estimateAffine2D`), not a bespoke formula -- safe to reimplement directly from standard least-squares affine
+fitting references.
+
+### FtCalcSimScore(UINT8 *tMask, UINT8 *tBin, UINT8 *sMask, UINT8 *sBin, SINT32 rows, SINT32 cols, FP32 *H, UINT16 *overlapSize) -- FULLY TRACED via raw disassembly (not just decompiler output)
+This is the core final-score formula. For every (row,col) in the target grid: apply the estimated affine
+transform `H` (2x3, incrementally computed per-pixel via linear per-column deltas rather than recomputed from
+scratch -- a performance optimization, not a different algorithm) to get the corresponding source coordinate;
+round to nearest integer; bounds-check. If in bounds: increment `overlapSize` (total pixels landing in bounds,
+regardless of match). If BOTH `tMask[here]` and `sMask[there]` are nonzero (mutually valid/foreground per the
+earlier-traced segmentation masks): increment `validCnt`, read `tBin[here]` and `sBin[there]` (the
+**bit-packed BINARIZED IMAGES from `FtGenBinImgForSamllSensor`, NOT the per-feature `bDescri` descriptors**),
+combine into a 2-bit index (`tBin*1 + sBin*2`, i.e. one of the 4 possible (0,0)/(1,0)/(0,1)/(1,1) outcomes),
+and increment a 4-entry outcome counter `cnt[index]`.
+```
+final_score = (cnt[0] + cnt[3]) / validCnt
+```
+i.e. **the fraction of mutually-valid, geometrically-aligned pixels where the two binarized ridge images
+AGREE** (both foreground or both background) -- a normalized agreement/similarity rate on the aligned binary
+images, not a Hamming distance on the per-feature descriptors. `cnt[1]`/`cnt[2]` (disagreements) are computed
+but not used in this particular score (at least not in this function -- `FtCalcSimScoreRefit`, not traced, may
+use them differently).
+
+### Why this succeeds where this session's earlier raw-pixel correlation attempt failed
+This retroactively explains the STEP 2/STEP 5 correlation failure from earlier in this project: the real
+algorithm does NOT do blind whole-image correlation search over rotation/translation (what this session tried
+and found didn't separate same/different finger, even after calibration). Instead it (a) finds keypoint
+correspondences via the binary descriptor, (b) robustly estimates a proper geometric transform from those
+correspondences via RANSAC + least-squares affine fit (not a blind brute-force search), and (c) only THEN
+computes a masked agreement score on the two images once properly aligned -- on the BINARIZED ridge pattern,
+not raw grayscale. Both the alignment method and the signal being compared are qualitatively more robust than
+this session's earlier from-scratch attempt, which is now understood to have been missing exactly these two
+ingredients.
+
+### Deliberate scope decision: RANSAC internals and FAR calibration deferred
+`FtRansacAngle_32f`/`FtRansacEdage_32f` (90-98 cx each, ~4-5.7KB) and the FAR-threshold/classifier logic
+(`FtCheckFAR`, `FtClassifierCutFar`) were NOT traced in depth this pass. Reasoning: RANSAC-based robust
+estimation is itself a well-documented, standard technique (random/heuristic minimal-sample selection,
+consensus-set scoring, iterate) -- the exact heuristic FocalTech uses for candidate correspondence selection
+matters less than getting a WORKING robust affine estimator in place first, which can be validated empirically
+against real captured data (does the resulting alignment look geometrically sane; does the final score
+separate same/different finger) rather than requiring byte-exact replication of the original's specific
+RANSAC sampling strategy. FAR-threshold calibration is a tunable security parameter, not core algorithm
+correctness -- deferred to the empirical validation phase (Step 5) once a working scorer exists.
+
+### Practical implication: architecture and core math for the full pipeline now understood end-to-end
+Combined with Steps 1-3 (preprocessing, OpenSIFT-equivalent detection/orientation, steered concentric-ring
+binary descriptor with extracted data tables), the entire template-extraction-and-matching pipeline's
+architecture and core formulas are now understood well enough to begin writing a first C reimplementation,
+with RANSAC-strategy details and FAR calibration to be refined empirically during testing rather than blocking
+implementation start.
