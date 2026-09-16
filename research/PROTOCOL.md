@@ -2439,3 +2439,33 @@ binary descriptor with extracted data tables), the entire template-extraction-an
 architecture and core formulas are now understood well enough to begin writing a first C reimplementation,
 with RANSAC-strategy details and FAR calibration to be refined empirically during testing rather than blocking
 implementation start.
+
+## Reimplementation started: tools/focal_match.c, Step 1 first draft (2026-09-16)
+
+Status: COMPILES, smoke-tested (runs without crashing, returns expected sentinel values on synthetic input).
+NOT YET VALIDATED against real captures or the real .so's intermediate buffers -- explicitly not claiming this
+produces correct output yet, per this session's "don't round up" rule. This is a first draft to build on.
+
+Implemented in `tools/focal_match.c`, each function tagged CONFIRMED or BEST-EFFORT inline:
+- `border_interpolate_101`, `box_filter_32f`, `gaussian_blur_u8_inplace`, `normalize_32f_to_8u` -- the shared
+  OpenCV-equivalent primitives (CONFIRMED algorithm; `gaussian_blur_u8_inplace`'s auto-sigma formula is
+  BEST-EFFORT, assumed to follow OpenCV's convention but not independently bit-verified).
+- `focal_non_linear_stretch_u8` -- CONFIRMED overall structure; its one internal BEST-EFFORT piece
+  (`local_equalize_hist_v2_bestguess`) uses a placeholder symmetric local-mean window instead of the real
+  function's not-fully-resolved asymmetric window shape.
+- `focal_gray_mean_sub` -- CONFIRMED, direct translation of the traced algorithm.
+- `focal_local_contrast_enhance` -- CONFIRMED, direct translation with the exact extracted constants
+  (gain=0.2, floor=1.0, epsilon=1e-6, scale=250.0).
+- `focal_segment_by_local_variance` -- CONFIRMED core variance-threshold logic; erode/dilate steps are
+  BEST-EFFORT square structuring elements standing in for the not-independently-traced `FtErode`/`FtDilate`.
+
+### Next steps for the reimplementation
+1. Validate this Step 1 draft against real captures from `research/captures/calibrated_set/` and, where
+   possible, against the real `.so`'s intermediate buffers (dump via `gdb`) -- per the plan stated from the
+   start of this reimplementation effort, this is the only reliable way to confirm correctness rather than
+   "compiles and runs."
+2. Implement Step 2 (OpenSIFT-equivalent detection/orientation, using the fetched public reference material)
+   and Step 3 (steered binary descriptor, using the extracted `coordinarePairs`/`ModePairs` tables) similarly.
+3. Implement Step 4 (RANSAC + affine fit + the confirmed `FtCalcSimScore` agreement-rate formula).
+4. Only then re-run the same 45-pairwise same/different-finger comparison this session already has real data
+   for, and report the raw scores plainly.
