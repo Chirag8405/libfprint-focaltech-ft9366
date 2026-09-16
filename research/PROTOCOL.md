@@ -307,3 +307,62 @@ Fw9366_cfg[0x11] = 0x08
 
 ### Next concrete action
 Trace `fw9366_get_SMIC_IC_flag()` (~628 bytes) next, both to resolve the `smic_flag` branch above and because it is the next function in the real call order (`fw9366_init_chip` calls it before `cfg_init`). Likely candidate for the first *real* USB traffic beyond the wake ping, since "get flag" implies reading something back from the device/OTP.
+
+## Update: fw9366_get_SMIC_IC_flag traced and CONFIRMED against real hardware (2026-09-16)
+
+Status: CONFIRMED (static disassembly AND live hardware test, clean single-attempt result, no ambiguity)
+
+### fw9366_get_SMIC_IC_flag (address 0x1557cc)
+
+Not a stub -- this is a real hardware read, distinct from the wake ping. Logic:
+
+```
+smic_flag = 0x00  ; default
+for attempt in 0..9 (up to 10 tries, no sleep between attempts in traced code):
+  val = fw9366_sfr_read(0x9b)
+  shifted = val >> 2   ; zero-extended byte, then shift -- confirmed via movzx+sar,
+                        ; sar==shr here since the zero-extended value is always 0-255
+  if shifted == 0x13: smic_flag = 0xaa; break
+  elif shifted == 0x00: smic_flag = 0x00; break
+  else: retry
+```
+
+### fw9366_sfr_read(reg) (address 0x165f86) -- NEW confirmed command, distinct framing from the wake ping
+
+Transport: `ff_spi_sfr_write_then_read_buf` (address 0x153a4d) -- structurally identical dispatch
+to the wake ping's `ff_spi_write_then_read_buf_rts` (same BusType check, same underlying
+`User_TL_Transmit_N_Byte` write(type=2)/read(type=1) pair, i.e. same bulk EP 0x01 OUT / EP 0x82 IN
+transport), but different buffer framing:
+
+```text
+SFR_READ(reg):
+  Bulk OUT ep0x01: [0x08, 0xf7, reg, 0x00, 0x00]   (5 bytes)
+  Bulk IN  ep0x82: 1 byte response
+  return response byte
+```
+
+### Live hardware test result (tools/rts5811_wake_test.c, real device)
+
+```
+sfr_read(0x9b) attempt 1:
+  sent: 08 f7 9b 00 00
+  recv: 00                (1 byte, immediate, no retry needed)
+  raw=0x00  (raw>>2)=0x0
+  -> smic_flag = 0x00
+```
+
+CONFIRMED for this physical unit: `smic_flag = 0x00`. This resolves the previously-undetermined branch in `fw9366_cfg_init`: `Fw9366_cfg[0xc..0xd] = 0x00c8` (not `0x0096`).
+
+### Unit-specific vs. generic
+
+`fw9366_sfr_read` genuinely reads live silicon (a real register on the actual chip) -- not host-computed. However the specific *value* it decodes to (0x00 vs 0x13) is a foundry/mask-revision identifier, not a per-device serial or calibration constant -- it should read the same for every unit fabbed in the same batch/foundry, not just this one laptop. Safe to treat as effectively generic for "FT9366 units from the same foundry as mine," but it IS a real read, not an assumption -- flagging the distinction as asked.
+
+### Call order confirmed
+`fw9366_get_SMIC_IC_flag()` runs BEFORE `fw9366_cfg_init()` in `fw9366_init_chip`'s real sequence (already established in the earlier `fw9366_init_chip` trace), and does NOT run as part of `rts5811_init_chip` (which only touches the separate `rts5811_dev_info_st` struct, unrelated). No dependency in the other direction: `cfg_init` depends on `get_SMIC_IC_flag`'s output (`smic_flag`), not vice versa.
+
+### Running tally of confirmed-working real commands
+1. Wake ping: `4c 5a 01 00` -> `04 00 00 04` (proceed)
+2. SFR read: `08 f7 <reg> 00 00` -> 1 byte (tested with reg=0x9b -> `0x00`)
+
+### Next concrete action
+Trace `fw9366_init_flag()` and `fw9366_intflag_clear(0xffff)` (both run between `get_SMIC_IC_flag` and `cfg_init` in the real sequence -- note: `fw9366_init_chip`'s call order per the earlier trace is Get_OTP_Info -> get_SMIC_IC_flag -> init_flag -> intflag_clear -> cfg_init -> Update_Base -> fdt_auto_start -> poa_send_para). `fw9366_Get_OTP_Info` was skipped over in the original trace summary and has not been individually disassembled yet either -- check it next since it runs first in the chain, before get_SMIC_IC_flag.

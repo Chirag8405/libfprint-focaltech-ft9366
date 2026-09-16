@@ -153,8 +153,44 @@ int main(void)
 
     hexdump("  Fw9366_cfg if smic_flag==0xaa   ", fw9366_cfg_smic_aa, sizeof(fw9366_cfg_smic_aa));
     hexdump("  Fw9366_cfg if smic_flag!=0xaa   ", fw9366_cfg_smic_other, sizeof(fw9366_cfg_smic_other));
-    printf("  (smic_flag itself is not yet known -- depends on fw9366_get_SMIC_IC_flag,\n");
-    printf("   not yet traced. No hardware bytes were sent for this step.)\n");
+
+    /* --- fw9366_get_SMIC_IC_flag() / fw9366_sfr_read() reimplementation ---
+     * Traced from static disassembly (fw9366_get_SMIC_IC_flag at 0x1557cc,
+     * fw9366_sfr_read at 0x165f86, transport ff_spi_sfr_write_then_read_buf
+     * at 0x153a4d). This IS a real hardware transfer -- distinct command
+     * framing from the wake ping, but same underlying bulk EP 0x01/0x82
+     * transport (same User_TL_Transmit_N_Byte path, confirmed by reading
+     * ff_spi_sfr_write_then_read_buf's disassembly).
+     *
+     * fw9366_sfr_read(reg): write 5 bytes [0x08, 0xf7, reg, 0x00, 0x00],
+     * read 1 byte back. Real device logic retries fw9366_sfr_read(0x9b) up
+     * to 10 times (no sleep between attempts in the traced code), decoding
+     * (byte >> 2): ==0x13 -> smic_flag=0xaa; ==0x00 -> smic_flag=0x00;
+     * else -> retry. */
+    printf("\n== fw9366_get_SMIC_IC_flag(): fw9366_sfr_read(0x9b), up to 10 attempts ==\n");
+    int smic_flag = -1; /* -1 = undetermined after all attempts */
+    for (int i = 0; i < 10; i++) {
+        unsigned char sfr_cmd[5] = { 0x08, 0xf7, 0x9b, 0x00, 0x00 };
+        unsigned char sfr_resp[1] = { 0 };
+        printf("-- sfr_read attempt %d --\n", i + 1);
+        int wr = bulk_write(h, sfr_cmd, sizeof(sfr_cmd));
+        int rr = bulk_read(h, sfr_resp, sizeof(sfr_resp));
+        if (wr != 0 || rr != 0) { continue; }
+        /* traced code: movzx eax, byte (zero-extend) then sar eax,2 -- since
+         * the zero-extended value is always 0-255, sar==shr here; use
+         * unsigned shift to match exactly. */
+        int shifted = ((unsigned int)sfr_resp[0]) >> 2;
+        printf("  raw=0x%02x  (raw>>2)=0x%x\n", sfr_resp[0], shifted & 0xff);
+        if (shifted == 0x13) { smic_flag = 0xaa; printf("  -> smic_flag = 0xaa\n"); break; }
+        if (shifted == 0x00) { smic_flag = 0x00; printf("  -> smic_flag = 0x00\n"); break; }
+        printf("  -> neither match, retrying\n");
+    }
+    if (smic_flag == -1) {
+        printf("\n== smic_flag undetermined after 10 attempts (no match and/or all transfers failed) ==\n");
+    } else {
+        printf("\n== RESOLVED: smic_flag = 0x%02x -> Fw9366_cfg[0xc..0xd] = %s ==\n",
+               smic_flag, smic_flag == 0xaa ? "0x0096" : "0x00c8");
+    }
 
     libusb_release_interface(h, 0);
     libusb_close(h);
