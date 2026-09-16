@@ -2954,3 +2954,19 @@ reference/sign difference not caught by this filter's tolerance. Getting further
 question would most reliably come from extracting the real algorithm's intermediate SAMPLE VALUES (not just
 the final descriptor) at a known keypoint -- a more invasive extraction than what's been done so far, not yet
 attempted.
+
+## Real intermediate sample array extracted for a specific keypoint (2026-09-16)
+
+Status: CONFIRMED, real data extracted directly from inside `FtMfbDescriptors` via a gdb breakpoint (not
+inferred). Saved to `research/ground_truth/same5_feat0_real_samples.txt`.
+
+Broke at `bias + FtMfbDescriptors_offset + 0x2e0` (the point right after the 45-point sample-collection loop
+completes, before the `ModePairs` bit-comparison loop begins), for the keypoint at `same5.raw` feat1 index 66
+(`x=62.525066, y=45.641518, ori=-0.314893`, real final descriptor
+`27f777ff 90703880 be5ffb67 780e39fd 0000040e 3ffffce0 fffffef7 c00244f9`). This is the deepest ground truth
+extracted so far: the actual per-sample pixel intensities the real algorithm computed, not just its final
+descriptor bits -- the key asset for precisely localizing whether the remaining bug is in sampling (wrong
+pixel coordinates/interpolation/pyramid level) or in the bit-comparison stage (ModePairs indexing/operator).
+
+Not yet done in the previous session: reproducing this exact keypoint's 45 samples in `focal_sift.c` and
+diffing value-by-value against this real array -- picking this up now.
