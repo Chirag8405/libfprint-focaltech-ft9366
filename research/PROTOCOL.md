@@ -3712,3 +3712,74 @@ algorithm's structure. Next concrete step: extract fresh real `gauss_pyr` ground
 octave/interval (not just the img_dbl stage already checked) and diff precisely, to determine whether the
 sharpness discrepancy originates in the initial doubling stage specifically or compounds through
 `build_gauss_pyr`'s own per-level blur.
+
+## Follow-up: deeper pyramid-level ground truth extracted; two concrete pyramid-precision hypotheses tested, both inconclusive/refuted (2026-09-16)
+
+Status: Continued the recommended next step (diff a deeper `gauss_pyr` level against fresh real ground truth).
+Found a genuinely new, useful fact (the discrepancy does not compound with depth) and one real, kept
+correctness fix (Gaussian kernel truncation radius), but neither closes the rotation-repeatability gap.
+Reporting the negative results plainly rather than declaring victory.
+
+### New ground truth: gauss_pyr[1][2] (deeper interval, same octave) extracted and compared
+Extracted real `gauss_pyr[1][2]` row 45 (cols 47-76) and column 62 (rows 30-59) via the same
+`FtMfbDescriptors` breakpoint technique used earlier for `gauss_pyr[1][0]`, on the same image/location. Result:
+```
+                row45 SSE   row45 max-diff   col62 SSE   col62 max-diff
+interval 0:       276.8          13.24          106.0          3.86
+interval 2:       191.9           8.46           40.3          2.13
+```
+**The discrepancy SHRINKS at the deeper interval, it does not compound.** This is a real, useful negative
+result against the "compounds through per-level blur" framing: it means whatever causes this reimplementation's
+pyramid to be measurably sharper than the real one is concentrated at or before the octave-transition
+(`gauss_pyr[o][0]`, the freshly-downsampled level), and subsequent within-octave Gaussian blurring dilutes
+(low-pass-filters) the discrepancy rather than amplifying it -- an expected mathematical property of successive
+convolution, not evidence of a bug specifically at the downsample step. Independently re-verified
+`downsample_nn`'s pixel-selection formula (`sr = (int)(r * 2.0)`, i.e. floor of doubled index) against OpenCV's
+actual `CV_INTER_NN` resize convention for an exact 2x downscale (`sx = cvFloor(dx * inv_scale)` with
+`inv_scale=2.0`) -- these match exactly; `downsample_nn` is not the bug.
+
+### Hypothesis tested and REFUTED: Gaussian kernel truncation radius
+Found and fixed a real, independently-verifiable discrepancy: `gaussian_blur_f`'s kernel radius formula
+(`ceil(sigma*3)`) was based on OpenCV's `CV_8U` (integer-image) auto-kernel-size convention, but this pipeline's
+pyramid is float (`CV_32F`) throughout, and OpenCV's actual formula for non-`CV_8U` depth uses a 4-sigma (not
+3-sigma) truncation: `ksize = round(sigma*4*2+1)|1`. At this pipeline's base sigma (1.6), that's radius=7 vs.
+the old radius=5 -- a 40% narrower kernel than the technically-correct OpenCV convention. Fixed to match.
+**Empirically, this made a negligible difference** (row45/interval2 SSE 191.9 -> 187.7, ~2%; full rotation-sweep
+scores unchanged within noise). This is expected in retrospect: the kernel is renormalized after truncation
+(dividing by the truncated sum), which already compensates for most of the missing tail mass at these sigma
+values (a normalized Gaussian's mass beyond 3-sigma is under 0.3%). Kept the fix anyway since it is the more
+technically correct OpenCV convention and does not regress anything, but it does NOT explain the sharper-pyramid
+finding or the rotation-repeatability gap.
+
+### Causal probe: does deliberately adding more blur improve rotation-repeatability at all?
+As a blunt test of whether "pyramid sharpness" is really the operative lever (independent of finding the exact
+correct formula), temporarily increased `FOCAL_SIGMA` from 1.6 to 2.0 (a deliberately non-"correct" probe, not
+a proposed fix) and re-ran `test_synthetic_repeatability`. Result was noisy and non-monotonic: theta=5deg
+improved (64%->80%) but theta=3deg and the combined dx=2,dy=1,theta=3 transform got WORSE (80%->69%,
+69%->62%). This is inconclusive rather than a clean confirmation, most likely because changing the base sigma
+also changes which keypoints are detected at all (feature count changed from 44 to 39), confounding a like-for-
+like comparison rather than isolating a pure "more blur, same keypoints, more stable" effect.
+
+### Honest status: root cause of excess rotation-instability remains unidentified
+Two independent, concrete, well-reasoned hypotheses (bicubic-vs-bilinear img_dbl upscale, tried in an earlier
+session; Gaussian kernel truncation radius, tried this session) have both been tested and found to NOT
+meaningfully close the gap, despite the underlying "sharper pyramid" observation being real and independently
+reproduced via direct ground-truth row/column comparison. The blunt sigma-increase probe is inconclusive due to
+a confound (changed keypoint set), not a clean refutation, but does not provide clear positive support either.
+This is now the SAME pattern already seen at the matching stage earlier in this project (multiple well-reasoned,
+concrete fixes tried without resolving the target symptom) -- suggesting either the true cause is a more subtle
+numerical detail not yet identified, or (per the project's own repeated experience) that continued guess-and-
+check against known algorithm conventions (OpenCV defaults, OpenSIFT source) has reached diminishing returns,
+and the more decisive path forward would be fully disassembling the real algorithm's OWN pyramid-construction
+code (`FtBuildGaussPyr`) with the same raw-disassembly rigor already applied to `FtCalcSimScore` and
+`FtEstimateRotParms_32f`, rather than continuing to test hypotheses against general-purpose library conventions
+that may not match FocalTech's own specific implementation choices.
+
+### Recommendation
+Given the effort-to-result ratio of hypothesis-testing against conventions has now been unfavorable twice in a
+row (matching stage: 8 attempts; pyramid precision: 2 more attempts just now), the highest-value next step is
+likely full raw disassembly of `FtBuildGaussPyr`/`FtCreateInitImg` (both previously only structurally mapped,
+never fully traced line-by-line) to extract FocalTech's own exact blur/interpolation formulas directly, the
+same way `FtCalcSimScore` and `FtEstimateRotParms_32f` were fully nailed down earlier this project -- rather
+than further guess-and-check against generic OpenCV/OpenSIFT conventions that have now twice failed to explain
+a confirmed, real discrepancy.

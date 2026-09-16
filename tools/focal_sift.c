@@ -83,15 +83,29 @@ static float img_get(const FImage *im, int r, int c)
 }
 static void img_set(FImage *im, int r, int c, float v) { im->data[r * im->cols + c] = v; }
 
-/* Separable Gaussian blur on a float image, arbitrary sigma (OpenCV-style
- * kernel radius = ceil(sigma*3)*2+1, matching OpenCV's default ksize<-0
- * auto-sizing convention -- BEST-EFFORT, same caveat as gaussian_blur_u8
- * in focal_match.c). */
+/* Separable Gaussian blur on a float image, arbitrary sigma. FIXED (this
+ * session's rotation-repeatability follow-up, research/PROTOCOL.md): the
+ * previous radius formula (ceil(sigma*3)) was WRONG -- that is OpenCV's
+ * auto-kernel-size truncation for CV_8U (integer) images specifically.
+ * This pyramid operates on CV_32F (float) data throughout (OpenSIFT's own
+ * build_gauss_pyr calls cvSmooth on float images), and OpenCV's actual
+ * auto-sizing formula for non-CV_8U depth uses a 4-sigma (not 3-sigma)
+ * truncation: `ksize = round(sigma*4*2+1)|1` (OpenCV's
+ * createGaussianKernels). At sigma=1.6 (this pipeline's base sigma) this
+ * is radius=7 vs. the old radius=5 -- a 40% narrower kernel than correct,
+ * producing a systematically less-complete (sharper) blur at every
+ * pyramid level. This directly matches an earlier-confirmed finding
+ * (this reimplementation's gauss_pyr content is measurably sharper than
+ * the real algorithm's, steeper edges/~1px-early rising edges) and is the
+ * leading candidate for this reimplementation's excess rotation-
+ * instability relative to the real algorithm (ground-truth-confirmed,
+ * same PROTOCOL.md entry). */
 static void gaussian_blur_f(FImage *im, double sigma)
 {
-    int radius = (int)ceil(sigma * 3.0);
-    if (radius < 1) radius = 1;
-    int ksize = radius * 2 + 1;
+    int ksize = (int)lround(sigma * 4.0 * 2.0 + 1.0);
+    if (ksize % 2 == 0) ksize++;
+    int radius = (ksize - 1) / 2;
+    if (radius < 1) { radius = 1; ksize = 3; }
     double *kernel = malloc((size_t)ksize * sizeof(double));
     double sum = 0;
     int i, r, c;
