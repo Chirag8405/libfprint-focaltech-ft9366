@@ -153,6 +153,23 @@ static FImage *create_init_img(const unsigned char *src, int rows, int cols,
     }
 }
 
+/* CONFIRMED structural match: OpenSIFT's downsample (CV_INTER_NN --
+ * nearest neighbor, not bilinear; audit fix, see PROTOCOL.md). */
+static FImage *downsample_nn(const FImage *src, int newRows, int newCols)
+{
+    FImage *dst = img_new(newRows, newCols);
+    double rowScale = (double)src->rows / newRows;
+    double colScale = (double)src->cols / newCols;
+    int r, c;
+    for (r = 0; r < newRows; r++)
+        for (c = 0; c < newCols; c++) {
+            int sr = (int)(r * rowScale);
+            int sc = (int)(c * colScale);
+            img_set(dst, r, c, img_get(src, sr, sc));
+        }
+    return dst;
+}
+
 /* CONFIRMED structural match: OpenSIFT's build_gauss_pyr. */
 static FImage ***build_gauss_pyr(FImage *base, int octvs, int intvls, double sigma)
 {
@@ -173,7 +190,7 @@ static FImage ***build_gauss_pyr(FImage *base, int octvs, int intvls, double sig
                 memcpy(pyr[o][i]->data, base->data, (size_t)base->rows * base->cols * sizeof(float));
             } else if (i == 0) {
                 FImage *prev = pyr[o - 1][intvls];
-                pyr[o][i] = resize_bilinear(prev, prev->rows / 2, prev->cols / 2);
+                pyr[o][i] = downsample_nn(prev, prev->rows / 2, prev->cols / 2);
             } else {
                 pyr[o][i] = img_new(pyr[o][i - 1]->rows, pyr[o][i - 1]->cols);
                 memcpy(pyr[o][i]->data, pyr[o][i - 1]->data,
@@ -337,6 +354,12 @@ static void scale_space_extrema(FImage ***dog, int octvs, int intvls,
     int o, i, r, c;
     for (o = 0; o < octvs; o++) {
         int H = dog[o][0]->rows, W = dog[o][0]->cols;
+        /* CONFIRMED structural match: OpenSIFT's per-octave feature_mat
+         * dedup bitmask (audit fix -- previously dropped). Prevents the
+         * same final (r,c,intvl) location from being pushed twice if two
+         * different search starting points converge to it during
+         * interp_extremum's iterative refinement. */
+        unsigned long *featureMat = calloc((size_t)H * W, sizeof(unsigned long));
         for (i = 1; i <= intvls; i++)
             for (r = SIFT_IMG_BORDER; r < H - SIFT_IMG_BORDER; r++)
                 for (c = SIFT_IMG_BORDER; c < W - SIFT_IMG_BORDER; c++) {
@@ -362,6 +385,14 @@ static void scale_space_extrema(FImage ***dog, int octvs, int intvls,
                     if (fabs(contr) < contr_thr / intvls) continue;
                     if (is_too_edge_like(dog[oo][ii], rr, cc, curv_thr)) continue;
 
+                    /* ii is always <= intvls (<=8 for any sane intvls), so
+                     * OpenSIFT's "intvl > sizeof(unsigned long)" branch is
+                     * dead code here too -- the bitmask check always
+                     * applies, matching real-world behavior. */
+                    unsigned long bit = 1UL << (ii - 1);
+                    if (featureMat[W * rr + cc] & bit) continue;
+                    featureMat[W * rr + cc] |= bit;
+
                     FocalKeypoint kp = {0};
                     kp.x = (float)((cc + xc) * pow(2.0, oo));
                     kp.y = (float)((rr + xr) * pow(2.0, oo));
@@ -371,6 +402,7 @@ static void scale_space_extrema(FImage ***dog, int octvs, int intvls,
                     kp.subintvl = (float)xi;
                     kp_push(out, kp);
                 }
+        free(featureMat);
     }
 }
 

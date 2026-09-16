@@ -2581,3 +2581,78 @@ Consistent with the lesson already learned earlier this session (the original NC
 continuing to adjust thresholds speculatively without a new diagnostic. Logging this honestly as the current
 state of the reimplementation and flagging concretely which of the three validation paths above is worth
 pursuing next, for the next work session.
+
+## OpenSIFT line-by-line audit of focal_sift.c -- two real fixes found, core failure NOT resolved (2026-09-16)
+
+Status: Completed a full line-by-line comparison of `focal_sift.c` against OpenSIFT's actual public source
+(re-fetched via WebFetch), function by function. Found and fixed two genuine discrepancies; retested; the
+core same-vs-different-finger separation failure persists. Reporting honestly rather than claiming the audit
+"fixed" the problem.
+
+### Two real discrepancies found and fixed
+1. **`build_gauss_pyr`'s octave-transition downsample used bilinear interpolation; OpenSIFT's `downsample()`
+   uses nearest-neighbor (`CV_INTER_NN`)**. Added `downsample_nn()` and switched to it. This is a genuine
+   fidelity fix (bilinear softens/blends pixels in a way nearest-neighbor subsampling does not), though its
+   practical impact on final scores turned out to be small.
+2. **`scale_space_extrema` was missing OpenSIFT's per-octave `feature_mat` dedup bitmask entirely.** OpenSIFT
+   guards against pushing the same converged `(r,c,intvl)` location twice if two different search starting
+   points converge there during `interp_extremum`'s iterative refinement. Added the equivalent bitmask logic.
+   Confirmed `ii` (final interval) is always `<= intvls` (<=8) for any realistic `intvls`, so OpenSIFT's own
+   "intvl > sizeof(unsigned long)" branch is dead code in practice -- matches, not an oversight on my part.
+
+### Everything else checked line-by-line and found to be a correct translation
+`create_init_img`, `build_dog_pyr`, `deriv_3D`/`hessian_3D`/`interp_step`/`interp_contr` (matrix math and
+sign conventions verified term-by-term against OpenSIFT's actual formulas), `is_too_edge_like`, `is_extremum`,
+`calc_feature_scales`, `adjust_for_img_dbl`, `calc_grad_mag_ori` (including its non-obvious flipped `dy` sign
+convention, which matches), `ori_hist`, `smooth_ori_hist`, `dominant_ori`, `interp_hist_peak`,
+`add_good_ori_features` -- all confirmed as correct translations of the public reference, not just "looks
+similar." The Gaussian pyramid's incremental-sigma blur schedule was independently re-verified mathematically
+(successive Gaussian blurs compose via `sqrt(sigma_a^2+sigma_b^2)`; the schedule produces exactly
+`sigma*k^i` total blur at each level, matching Lowe's/OpenSIFT's design).
+
+### Descriptor sampling: reconsidered and ruled out one suspicion
+Considered whether `coordinarePairs`' fixed pixel radii (4/8/13) should be scaled by each keypoint's
+`scl_octv` before rotation/sampling (as the orientation histogram's window radius already is). Concluded this
+is correctly NOT needed: descriptors are sampled from `gauss_pyr[octv][intvl]`, and each OCTAVE is already a
+different-resolution image (half the linear size of the previous octave) -- so a fixed pixel radius on that
+octave's own image already represents a proportionally larger physical distance at coarser octaves, without
+needing an additional explicit scale multiply. This was reasoned through carefully rather than assumed, but
+is NOT independently confirmed against real disassembly (the original trace notes don't show or rule out an
+extra scale-multiply instruction) -- flagged as reasoned-but-unconfirmed, not certain.
+
+### Diagnostic: descriptor diversity checked, no gross degeneracy found
+Built `tools/diag_descriptors.c` to check whether some captures' own descriptors are unusually low-diversity
+(many near-duplicate descriptors within one image), which would explain why certain captures score high
+against everything. Result: intra-image average pairwise Hamming distance is ~123-128 out of 256 for every
+capture tested (same1, same2, same5, same6, diff1, diff2) -- statistically consistent with descriptors
+behaving like independent, unbiased random bit vectors relative to EACH OTHER within a single image. This
+rules out gross degeneracy (e.g. most descriptors collapsing to near-identical values) as the explanation.
+
+Noted, but not further chased this session: the EARLIER cross-image "best Hamming match" diagnostic (~42-51
+out of 256) is substantially lower than a naive extreme-value calculation would predict for ~40-60 truly
+independent random draws from a Binomial(256,0.5) distribution (~103 expected minimum). The most likely
+explanation is that the 256 descriptor bits are NOT independent of each other (only 45 underlying continuous
+sample values feed 256 pairwise-comparison bits, so many bits share an endpoint and are correlated) --
+correlated bits produce a heavier-tailed Hamming-distance distribution than the naive independent-bit model,
+making unusually-low best-matches far more probable by chance than the naive calculation suggests. This is a
+plausible, non-buggy structural explanation, not confirmed as the definitive cause.
+
+### Retest after both fixes: same failure pattern persists
+Full 45-pair retest: same5-vs-same6 (same finger) = 0.8565, same5-vs-diff1 (different finger) = 0.8402 --
+still barely distinguishable, matching the pre-fix pattern almost exactly. The specific-captures-score-high/
+low-against-everything pattern is unchanged. **Conclusion: the two fidelity fixes were real and worth keeping,
+but neither was the dominant cause of the separation failure.**
+
+### Honest state and recommended next steps for a future session
+The line-by-line audit did not surface a single definitive bug explaining the failure. Given the constraint
+that the real `.so` cannot be called even for validation (the user's earlier explicit decision), the most
+promising remaining avenues, in rough priority order:
+1. **Audit `focal_verify.c` (the matcher) with the same rigor just applied to `focal_sift.c`** -- not yet done
+   this session. The RANSAC/candidate-matching logic there is BEST-EFFORT/standard-technique, not audited
+   line-by-line against anything, and is a plausible source of "finds a plausible-looking fit for almost any
+   pair of small feature sets" behavior independent of whether the descriptors themselves are correct.
+2. Construct synthetic test images with known, controlled structure (e.g. a hand-crafted pattern translated/
+   rotated by a known amount) to verify the detector finds consistent keypoints/orientations and the
+   descriptor is genuinely rotation-invariant, independent of real capture noise.
+3. Gather more real captures per the original Step 5 plan (15-20 same-finger, 10+ different-finger) --
+   deferred until the matcher itself is more trustworthy, since more data won't resolve an architectural bug.
