@@ -3460,3 +3460,81 @@ matching what `FtEstimateRotParms_32f` computes), (4) one refinement pass (recom
 drop outliers, refit), (5) feed the result into the existing, already-confirmed `FtCalcSimScore` scoring. Will
 validate against `test_rotation_sweep`/`test_synthetic` first (should flatten the rotation-degradation curve
 close to 1.0), then the real same/different-finger dataset.
+
+## Reimplemented distance-consistency-graph rigid RANSAC; found and fixed a real bug; real separation still not achieved (2026-09-16)
+
+Status: Implemented `rigid_ransac_angle`/`estimate_rot_parms` in `focal_verify.c` per the confirmed
+`FtRansacAngle_32f`/`FtEstimateRotParms_32f` disassembly (previous entry). Found and fixed a genuine
+implementation bug along the way, confirmed a real improvement on the synthetic diagnostic, but the real
+same/different-finger dataset still shows no separation. Reporting all of this plainly.
+
+### Bug found and fixed: seed-neighborhood is not a mutually-consistent set
+First implementation: pick the max-degree candidate in the pairwise distance-consistency graph as a seed, and
+take ITS compatible neighbors as the inlier set. Debugging a complete failure (score=0.0000, 0 inliers) on a
+synthetic 7-degree same-image rotation test revealed why: two candidates (`cand[20]`: A=(74.84,73.36)
+vs B=(55.67,13.66); `cand[22]`: A=(72.36,81.61) vs B=(23.56,9.18) -- both obviously wrong correspondences, huge
+implausible displacements) were each individually pairwise-consistent with the seed, but NOT consistent with
+EACH OTHER (their own pairwise distance check differs by ~49px). Pairwise consistency is not transitive, so
+"consistent with one anchor point" does not imply "mutually consistent as a group" -- this let two clearly-wrong
+correspondences corrupt a otherwise-good 19-correspondence consensus set, producing a garbage rotation estimate
+(-1.56 degrees instead of the true ~7). Verified `estimate_rot_parms` itself is arithmetically correct first,
+via a controlled unit test with a known synthetic rotation+translation (exact recovery, 7.0000/3.0000/-2.0000
+in, 7.0000/3.0000/-2.0000 out) -- ruling out the closed-form formula as the bug's source before looking
+elsewhere.
+
+Fixed via standard greedy clique growth: each candidate added to the inlier set must be pairwise-consistent
+with EVERY current member, not just the seed (processing candidates in descending-degree order as the greedy
+heuristic -- not independently confirmed against FtRansacAngle_32f's own untraced tie-breaking rule, engineering
+judgment). This eliminates the corrupted-clique failure mode entirely.
+
+### Synthetic diagnostic improved, but the overall rotation-degradation curve is not fundamentally different
+Re-ran `test_rotation_sweep` on three images: no more catastrophic 0.0-score failures, and the curve is smoother
+(monotonic where it previously had a discontinuity at 7deg). But the OVERALL magnitude of degradation from
+rotation is roughly UNCHANGED from before this fix: still ~0.85-0.87 by 2-3 degrees, ~0.75-0.80 by 5-10 degrees,
+still overlapping with the different-finger baseline (~0.75-0.90) found in the original synthetic diagnostic.
+The bug fixed was real (corrupted consensus sets are a real failure mode worth eliminating) but was not,
+apparently, the dominant source of the rotation-sensitivity gap.
+
+### Full real 45-pair dataset: still no separation
+```
+same-finger scores:      0.77 - 0.89
+different-finger scores: 0.78 - 0.90
+```
+Fully overlapping, consistent with every previous attempt at this stage.
+
+### Revised understanding
+The synthetic diagnostic's own finding still stands and is now more precisely bounded: pure translation cleanly
+separates (0.93-0.97 vs 0.90 max different-image); rotation alone, even with a CORRECTLY implemented distance-
+consistency-graph rigid RANSAC (matching the real algorithm's confirmed core formulas), does not fully recover
+robustness -- degrading to the same range as genuinely different fingers by 3-5 degrees. Two live explanations,
+neither yet tested:
+1. Real captures involve more than simple rigid rotation between two captures of the same finger (skin
+   deformation under pressure, moisture, partial contact-area differences) -- non-rigid effects that a rigid
+   (rotation+translation-only) transform model cannot fully accommodate regardless of how correctly the RANSAC
+   consensus mechanism is implemented. This would mean the remaining gap is a genuine, physical limitation of
+   matching via a single global rigid transform, not a further reimplementation bug.
+2. `FtRansacEdage_32f` (the still-undissected second stage, ~5.7KB) may exist precisely to handle this -- e.g.
+   local/non-rigid refinement beyond the first stage's global rigid estimate, or working with ridge/edge
+   structure directly rather than point correspondences (consistent with its name). Not yet disassembled.
+3. A remaining detection-stage rotation/deformation sensitivity (this reimplementation's own keypoint
+   repeatability under rotation is imperfect -- detected feature COUNT changes substantially with synthetic
+   rotation, e.g. same1.raw: 53 features at 0deg vs 73-77 at 2.5-4deg, partially but not fully explainable by
+   the synthetic transform's own resampling artifacts) reducing the number of genuinely re-detectable common
+   keypoints before matching even begins, independent of how good the matching stage is.
+
+### Honest tally: matching-stage fix attempts across two sessions
+Eight independent, well-reasoned attempts at this stage (OpenSIFT fidelity fixes, RANSAC radius tightening,
+ratio test, two binarization-formula iterations, candidate-threshold sweep, confirmed distance-consistency-graph
+rigid RANSAC, and the clique-consistency bugfix within it) have all either made no difference or improved a
+narrower diagnostic (synthetic rotation) without closing the real-world separation gap. This is now a strong,
+repeated signal that the remaining problem is NOT a matching-stage implementation bug reachable by further
+tuning or even faithful disassembly of the confirmed pieces -- it is either a physical/non-rigid-deformation
+limitation (hypothesis 1/2 above) or a separate, not-yet-isolated detection-stage issue (hypothesis 3).
+
+### Recommended next step
+Disassemble `FtRansacEdage_32f` (0xf77c0) specifically to check whether it performs non-rigid/local refinement
+beyond the Angle stage's global rigid estimate -- this is the most direct way to test hypothesis 2 before
+concluding hypothesis 1 (an inherent physical limitation) by elimination. Alternatively, apply the same
+synthetic-diagnostic methodology to isolate hypothesis 3: run `test_rotation_sweep`-style detection-only
+(feature count and position stability, not full matching) on synthetic rotations to quantify how repeatable
+this reimplementation's own keypoint detection is under rotation, independent of the matching stage entirely.
