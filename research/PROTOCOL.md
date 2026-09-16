@@ -3903,3 +3903,91 @@ intermediate values for the identical alignment. This would definitively show wh
 separation is inherent to the scoring formula/this sensor (a real finding worth having, even if sobering) or
 whether a remaining implementation gap exists specifically in binarization/segmentation/masking that has not
 yet been ground-truth-validated the way detection and descriptors now have been.
+
+## DECISIVE GROUND-TRUTH TEST: real FtCalcSimScore, real binarization, real masks -- STILL no separation (2026-09-16)
+
+Status: CONFIRMED via direct calls into the real proprietary `.so`'s own `FtCalcSimScore`, `FtGenBinImg`, and
+`FtSegmentByLocalVariance` (diagnostic-only, per this project's standing decision). This is the most decisive
+test possible short of getting `FtVerifyTwoTemplate`/`FtGetTemplate` to run end-to-end (still blocked, see
+earlier entries) -- it isolates whether the persistent lack of same/different-finger separation is a
+reimplementation artifact or a property of the real scoring mechanism itself, given real inputs.
+
+### Method
+Built `tools/ground_truth_calcsimscore.c`. For a pair of real captures: build each one's 96x96 canvas (as
+already established), call the REAL `FtSegmentByLocalVariance` for masks and the REAL `FtGenBinImg` for
+binarized images (bit-packed UINT64 output, confirmed via DWARF and unpacked to bytes -- `arrLen=144` words
+returned in every test, `144*64=9216` bits `=96*96`, confirming the expected format), call the REAL
+`FtGetMfbFeatures` for keypoints (same technique already used throughout this project), then use THIS
+project's own confirmed-correct alignment estimator (distance-consistency graph + closed-form rigid fit) to
+find an alignment from real descriptor-matched correspondences, and finally call the REAL `FtCalcSimScore`
+with all-real inputs and this alignment.
+
+### New precise finding while building this: FtCalcSimScore's H-matrix layout and walk direction, pinned down exactly
+Re-disassembled `FtCalcSimScore` fully (446 bytes) specifically to nail down details never precisely confirmed
+before (the original trace described the algorithm conceptually but not the exact H indexing):
+- **H array layout is `[a, b, e, c, d, f]`** (mappedCol = H[0]*col + H[1]*row + H[2]; mappedRow = H[3]*col +
+  H[4]*row + H[5]) -- NOT `[a,b,c,d,e,f]` as this project's own `Affine2D` struct assumed (e and c are swapped
+  relative to this project's in-memory convention; this only matters when calling the REAL function directly,
+  since this project's own code is internally self-consistent regardless).
+- **The walk direction is the OPPOSITE of what this project's own `calc_sim_score` assumed**: the loop iterates
+  over the 3rd/4th argument's ("s") grid directly by its own (row,col) counters, maps each point through H into
+  the 1st/2nd argument's ("t") coordinate space, and checks/reads `sMask`/`sBin` at the raw loop coordinates but
+  `tMask`/`tBin` at the mapped coordinates. This means H must be supplied as the "s -> t" transform, matching
+  `estimate_rot_parms`'s natural un-inverted output (A ~= R(theta)*B + t) directly when called as
+  `FtCalcSimScore(A.mask, A.bin, B.mask, B.bin, ..., H)` -- no inversion needed (this project's own
+  `calc_sim_score`, which walks A's grid into B's, needs the opposite/inverted form, hence the
+  `rigid_BtoA_to_AtoB` conversion already in `focal_verify.c` -- that conversion is correct for this project's
+  own internal convention and was not itself in question).
+- The `overlapSize` out-parameter is actually **two packed UINT16 values** (validCnt at offset 0, in-bounds
+  overlap count at offset 2), not one -- calling with a single UINT16 would have silently overflowed 2 bytes of
+  stack. Fixed in the harness before running anything.
+
+### Result: real scores show no separation, and actually invert in one case
+```
+same1.raw vs same2.raw  (SAME finger):       score=0.8582  (validCnt=4176, n=16 rigid-fit correspondences)
+same5.raw vs same6.raw  (SAME finger):       score=0.9360  (validCnt=4048, n=76 rigid-fit correspondences)
+same5.raw vs diff1.raw  (different finger):  score=0.9238  (validCnt=4030, n=61 rigid-fit correspondences)
+same5.raw vs diff2.raw  (different finger):  score=0.9397  (validCnt=4049, n=68 rigid-fit correspondences)
+diff1.raw vs diff2.raw  (different finger):  score=0.9157  (validCnt=4056, n=66 rigid-fit correspondences)
+```
+**One genuine same-finger pair (same1/same2, 0.8582) scores LOWER than every different-finger pair tested
+(0.9157-0.9397)** -- not merely overlapping, but inverted relative to ground truth. All five scores cluster in
+a narrow 0.86-0.94 band regardless of true finger identity. In every case, the alignment-finding step found a
+large (16-76), geometrically tight (near-identity: rotation within +-0.2 degrees, translation within ~0.3px)
+mutually-consistent correspondence set -- these are not weak/marginal alignments; the geometric consensus
+itself looks confident and stable across every pair tested, same or different finger alike.
+
+### Interpretation
+This is the most conclusive test run this session, because THREE of the four major pipeline stages are now
+100% real (binarization, masking, and scoring), and the fourth (alignment-finding) uses this project's own
+independently-validated (via the synthetic diagnostic and the ground-truth rotation-repeatability comparison)
+correct algorithm on real descriptor-matched keypoint correspondences. This rules out reimplementation bugs in
+binarization, masking, or the scoring formula as an explanation -- those are the REAL functions, called
+directly, not approximations. It also makes an alignment-finding bug a much less likely explanation than
+before, since the found alignments are tight, high-consensus, and consistent regardless of true finger
+identity (not the signature of a confused/wrong RANSAC substitute -- a genuinely wrong alignment would more
+plausibly show LOW consensus or an implausible transform for the harder, different-finger pairs, not the same
+tight near-identity fit seen for same-finger pairs).
+
+### Two live explanations, neither yet confirmed
+1. **The `calibrated_set` validation dataset itself may not cleanly represent independent same/different-finger
+   captures the way its filenames suggest.** All pairs tested -- same-finger AND different-finger alike --
+   converge to a near-identity transform (rotation within a fraction of a degree, translation under 0.3px) with
+   large (60+) consensus sets. This is an unusually tight geometric agreement to see between captures of
+   supposedly DIFFERENT fingers, and raises a real question about how this dataset was collected (e.g. a fixed
+   capture rig, an artifact common to all captures, or fingers that are not as distinct as their same/diff
+   labels imply) -- not yet independently verified.
+2. **The masked-ridge-overlap-after-alignment scoring approach, even implemented and driven 100% correctly, may
+   not carry a strong finger-identity-specific signal on this small 64x80 sensor** -- consistent with this
+   project's much earlier "chance-collision"/"contact-area geometry" hypotheses, now reinforced by hard,
+   real-function-based evidence rather than a reimplementation artifact.
+
+### Recommended next step
+Before investing further in the matching/scoring pipeline, sanity-check the `calibrated_set` dataset itself:
+confirm (from whatever metadata or memory exists of how these captures were collected) that `same1-6.raw` are
+genuinely repeated captures of ONE physical finger and `diff1-4.raw` are genuinely OTHER physical fingers, not
+an artifact of the collection process. If the dataset is confirmed sound, the next concrete step is examining
+`FtCheckFAR`/`FtClassifierCutFar` (the FAR-calibration/decision stage, never examined this project) to see
+whether real verification relies on a threshold/signal this session's `FtCalcSimScore`-only test doesn't
+capture, or whether a larger, more carefully collected validation set is needed before drawing final
+conclusions about this approach's viability on this sensor.
