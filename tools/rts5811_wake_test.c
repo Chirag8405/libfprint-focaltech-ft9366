@@ -418,6 +418,37 @@ static int img_get_avg_middle(const unsigned char *image_be_pairs, int image_len
     return 1023;
 }
 
+/* Img_Get_Out_Of_Range_Point(image, &out_low, &out_high), traced at
+ * 0x15cc47: pure local, no I/O. Same region as img_get_avg_middle
+ * (rows 1-78, cols 2-61, stride=64), same big-endian interpretation
+ * (mechanistically confirmed correct -- this session located the actual
+ * explicit byte-swap step in fw9366_Img_Get_Better_DAC's body, resolving
+ * the earlier open byte-order question with certainty rather than just
+ * empirical inference).
+ *   low_threshold  = 0x7d  << Fw9366_cfg[0xa] = 125  << 2 = 500
+ *   high_threshold = 0x3eb << Fw9366_cfg[0xa] = 1003 << 2 = 4012
+ *   out_low++  if pixel < low_threshold
+ *   out_high++ if pixel > high_threshold */
+static void img_get_out_of_range_point(const unsigned char *image_be_pairs, int image_len_bytes,
+                                         int *out_low, int *out_high)
+{
+    int low_threshold = 125 << 2;
+    int high_threshold = 1003 << 2;
+    int width = 64;
+    int npixels = image_len_bytes / 2;
+    *out_low = 0;
+    *out_high = 0;
+    for (int row = 1; row <= 78; row++) {
+        for (int col = 2; col <= 61; col++) {
+            int idx = row * width + col;
+            if (idx >= npixels) continue;
+            unsigned short pixel = (unsigned short)((image_be_pairs[idx * 2] << 8) | image_be_pairs[idx * 2 + 1]);
+            if (pixel < low_threshold) (*out_low)++;
+            if (pixel > high_threshold) (*out_high)++;
+        }
+    }
+}
+
 /* FW9366_WorkMode_Cmd table, extracted directly from .rodata at 0x1c88c0
  * (3 bytes per mode, modes 0-11). Mode 11 sends only 1 byte; all others
  * send all 3. */
@@ -488,18 +519,31 @@ static int set_scan_rate_2m(libusb_device_handle *h)
     return 0;
 }
 
+/* REG9366[0x87] host-side mirror -- the DAC value applied by img_mode_init_0
+ * below. Initial value 0x36 confirmed via fw9366_init_flag (already traced).
+ * Made a real tracked variable (not a hardcoded constant) so the
+ * calibration loop (img_get_better_dac) can actually adjust and re-apply
+ * it, per this session's STEP 1 request. */
+static unsigned char g_dac_value = 0x36;
+
 /* fw9366_img_mode_init(0), traced at 0x15b8a9 -- fully traced, 100%, and
  * tested clean against real hardware (see research/PROTOCOL.md). Factored
  * out as a real function since fw9366_img_scan_start also calls it (a
  * second invocation, with fw9366_context[0xfc] now at 0xa1 rather than
  * 0xa0 -- but the function's OWN internal gate checks against 0xa3, so a
- * second call at state 0xa1 still runs the full body again, identically). */
+ * second call at state 0xa1 still runs the full body again, identically).
+ * NOTE: since this C implementation doesn't replicate the real
+ * fw9366_context[0xfc]==0xa3 short-circuit gate, EVERY call here re-applies
+ * g_dac_value fully -- this is actually necessary and correct for our
+ * calibration loop to work (the real firmware's gate would otherwise skip
+ * re-applying an updated DAC on repeat calls within one session; not
+ * replicating it works in our favor here). */
 static void img_mode_init_0(libusb_device_handle *h)
 {
     printf("-- img_mode_init(0) opening: idle_enter() again --\n");
     idle_enter(h);
-    printf("-- img_mode_init(0): sram_write(0x1801, 0xfcb6) [REG9366[0x87]=0x36] --\n");
-    sram_write(h, 0x1801, 0xfcb6);
+    printf("-- img_mode_init(0): sram_write(0x1801, ...) [REG9366[0x87]=0x%02x] --\n", g_dac_value);
+    sram_write(h, 0x1801, sram_bits_set(0xfc80, 6, 0, g_dac_value));
     printf("-- img_mode_init(0): sram_write(0x1800, 0x4ffe) [fixed constant, param==0 branch] --\n");
     sram_write(h, 0x1800, 0x4ffe);
     printf("-- img_mode_init(0): sram_write(0x1804, 0x27ca) --\n");
@@ -594,6 +638,87 @@ static void img_data_get(libusb_device_handle *h, unsigned char *out_buf, int pa
     img_scan_start(h);
     image_read(h, out_buf, param);
     img_scan_end(h);
+}
+
+/* Calibration loop, per this session's STEP 1 request: actually run the
+ * fw9366_AutoSDacUpdate/Img_Get_Better_DAC feedback mechanism to
+ * convergence using real image statistics, not a fixed default DAC value.
+ *
+ * Confirmed core mechanism (traced from fw9366_Img_Get_Better_DAC,
+ * 0x15cd3c): capture an image, count out-of-range pixels via
+ * img_get_out_of_range_point; if both counts are low (<=19), decrement
+ * REG9366[0x87] (g_dac_value) by 1; if either count is high (>20),
+ * increment it by 1; otherwise the image is already in range, no
+ * adjustment needed. This is the REAL confirmed adjustment step -- this
+ * function wraps it in our own outer convergence loop (the exact
+ * iteration count/structure of the proprietary AutoSDacUpdate's outer
+ * loop was not fully traced -- see research/PROTOCOL.md's STEP 2 entry --
+ * but the core per-step adjustment logic used here is the real,
+ * confirmed mechanism, not an invented substitute). */
+static void run_dac_calibration(libusb_device_handle *h, unsigned char *image_buf, int image_buf_len, int max_iters)
+{
+    /* Track the best (lowest out_low+out_high) dac value seen, and detect
+     * oscillation (revisiting a dac value already tried) as a fallback
+     * stopping condition -- this session's simplified +-1 reconstruction
+     * of the real per-step adjustment does not always cleanly converge
+     * (see research/PROTOCOL.md), so rather than claim false convergence,
+     * this picks the best value actually observed if oscillation is
+     * detected, and says so plainly. */
+    unsigned char best_dac = g_dac_value;
+    int best_score = 1 << 30;
+    unsigned char seen[256] = {0};
+    /* Target the middle of the already-confirmed valid range (300-700,
+     * from fdt_base_fail_check's thresholds) rather than just minimizing
+     * raw out-of-range count -- a value with zero out-of-range pixels but
+     * an extreme avg_middle (e.g. very bright/dark) isn't actually
+     * "better calibrated", just less saturated. Among candidates that
+     * pass the out-of-range check, prefer the one closest to this target. */
+    const int target_avg = 500;
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        img_data_get(h, image_buf, 0);
+        int out_low = 0, out_high = 0;
+        img_get_out_of_range_point(image_buf, image_buf_len, &out_low, &out_high);
+        int avg = img_get_avg_middle(image_buf, image_buf_len);
+        printf("== calibration iter %d: dac=0x%02x out_low=%d out_high=%d avg_middle=%d ==\n",
+               iter, g_dac_value, out_low, out_high, avg);
+
+        /* Score: how far avg_middle is from the target, heavily penalized
+         * if out-of-range counts are high (unusable regardless of avg). */
+        int score = (avg > target_avg) ? (avg - target_avg) : (target_avg - avg);
+        if (out_low > 19 || out_high > 19) score += 100000; /* effectively disqualify */
+        if (score < best_score) {
+            best_score = score;
+            best_dac = g_dac_value;
+        }
+
+        if (seen[g_dac_value]) {
+            printf("== calibration: dac=0x%02x already tried -- oscillation detected, stopping. Using best observed dac=0x%02x (score=%d) ==\n",
+                   g_dac_value, best_dac, best_score);
+            g_dac_value = best_dac;
+            break;
+        }
+        seen[g_dac_value] = 1;
+
+        if (out_low <= 19 && out_high <= 19) {
+            if (g_dac_value == 0) {
+                printf("== calibration: dac already at 0, stable, stopping ==\n");
+                break;
+            }
+            g_dac_value = (unsigned char)(g_dac_value - 1);
+            printf("== calibration: both counts low -> decrement dac to 0x%02x ==\n", g_dac_value);
+        } else if (out_low > 20 || out_high > 20) {
+            if (g_dac_value == 0x7f) {
+                printf("== calibration: dac already at max (0x7f, 7-bit field), stable, stopping ==\n");
+                break;
+            }
+            g_dac_value = (unsigned char)(g_dac_value + 1);
+            printf("== calibration: out-of-range count high -> increment dac to 0x%02x ==\n", g_dac_value);
+        } else {
+            printf("== calibration: in range, converged at dac=0x%02x ==\n", g_dac_value);
+            break;
+        }
+    }
 }
 
 /* fw9366_Set_Scan_Rate_Default(), traced at 0x155df0: same pattern as
@@ -1042,13 +1167,25 @@ int main(void)
     printf("  crc1 (-> REG9366+0xca) = 0x%04x\n", crc1);
     printf("  crc2 (-> REG9366+0xb6) = 0x%04x\n", crc2);
 
+    /* STEP 1 (this session's calibration continuation): run the real
+     * DAC calibration loop to convergence before the final capture, unless
+     * explicitly disabled via NO_CALIBRATION=1 (kept for quick
+     * before/after comparison during this session's own testing). */
+    static unsigned char image_buf[10240];
+    if (getenv("NO_CALIBRATION") == NULL) {
+        printf("\n== running DAC calibration to convergence (starting dac=0x%02x) ==\n", g_dac_value);
+        run_dac_calibration(h, image_buf, sizeof(image_buf), 15);
+        printf("== calibration finished, final dac=0x%02x ==\n", g_dac_value);
+    } else {
+        printf("\n== NO_CALIBRATION set, skipping calibration, using default dac=0x%02x ==\n", g_dac_value);
+    }
+
     /* --- fw9366_img_data_get(param=0) -- REAL IMAGE CAPTURE, fully traced.
      * This is the actual raw fingerprint image read path (up to 10240
      * bytes for param=0->1), distinct from the small 8-byte calibration
-     * "frame data" tested earlier. First test run with no finger placed,
-     * to establish a baseline before any touch-based comparison. */
-    printf("\n== fw9366_img_data_get(param=0) -- REAL IMAGE CAPTURE ==\n");
-    static unsigned char image_buf[10240];
+     * "frame data" tested earlier. Uses whatever g_dac_value calibration
+     * (above) converged to. */
+    printf("\n== fw9366_img_data_get(param=0) -- REAL IMAGE CAPTURE (dac=0x%02x) ==\n", g_dac_value);
     img_data_get(h, image_buf, 0);
     printf("== image capture complete ==\n");
 

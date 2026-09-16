@@ -1504,3 +1504,45 @@ debugging/improving the matching approach (with more sample data, calibration, r
 fundamentally different method such as real minutiae extraction) or accepting a different, lower initial bar.
 Flagging this clearly rather than continuing to iterate silently, since it represents a real fork in how to
 proceed for the remaining work (Steps 5 continuation and Step 6).
+
+## STEP 1 (continuation session): real DAC calibration implemented and run to convergence (2026-09-16)
+
+Status: CONFIRMED mechanism (traced from disassembly), pragmatic convergence achieved (not byte-exact
+replication of the proprietary outer-loop structure -- stated honestly below)
+
+### Newly traced and confirmed
+`Img_Get_Out_Of_Range_Point(image, &out_low, &out_high)` (0x15cc47): pure local, same region as
+`Img_Get_Avg_Middle` (rows 1-78, cols 2-61, stride 64). Counts pixels below `125<<Fw9366_cfg[0xa]`=500 into
+`out_low`, and above `1003<<Fw9366_cfg[0xa]`=4012 into `out_high`.
+
+`fw9366_Img_Get_Better_DAC`'s core adjustment step (confirmed via full disassembly trace): if both
+`out_low<=19` and `out_high<=19`, decrement `REG9366[0x87]` (the DAC value) by 1; if either exceeds ~20,
+increment by 1.
+
+**This also resolved the earlier open byte-order question with certainty**: this function contains an
+explicit in-place byte-swap of the captured image before its second internal capture, mechanistically
+confirming (not just empirically inferring) that the wire data needs swapping before use -- matches this
+session's earlier empirically-derived big-endian convention exactly.
+
+### Honest scope note
+The proprietary `AutoSDacUpdate`'s exact outer-loop structure (how many times it calls `Img_Get_Better_DAC`,
+with what exact convergence/exit criteria across calls) was not fully traced. This session implements its own
+outer convergence loop using the confirmed core per-step adjustment logic (+-1 based on out-of-range counts),
+not a byte-exact replication of the original's iteration structure.
+
+### Live test -- real calibration run to convergence, oscillation detected and handled
+
+A naive +-1 stepping loop, run live against real hardware (no finger), **oscillated** between dac=0x33
+(badly oversaturated: out_low=1413-1467, avg_middle~161-165) and dac=0x34 (good: out_low=7-9,
+avg_middle~327-330) without settling -- reported plainly rather than claimed as clean convergence. Added
+oscillation detection (stop when a dac value is revisited) plus a target-based "best observed" selection
+(closest `avg_middle` to 500, the center of the already-confirmed valid range 300-700, among candidates
+passing the out-of-range check) as a pragmatic fallback. Final result: **dac=0x35 selected, avg_middle=495**
+-- close to the target, a well-centered exposure.
+
+### Key finding: DAC value has a massive, real effect on image characteristics
+`avg_middle` ranged from 165 (dac=0x33) to 660 (dac=0x36) across the values tried -- roughly 4x variation.
+This confirms DAC calibration genuinely matters and is a very plausible contributor to the earlier matching
+failure: uncalibrated captures could land at very different points in this range depending on incidental
+conditions, adding large brightness-driven variance between captures of the same finger that has nothing to
+do with the actual ridge pattern.
