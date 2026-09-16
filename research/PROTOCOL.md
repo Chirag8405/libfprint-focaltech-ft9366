@@ -2543,3 +2543,41 @@ Wire the already-CONFIRMED `focal_segment_by_local_variance` in as the validity 
 most likely to matter, already-correct code sitting unused in `focal_match.c`) before investigating anything
 else, then re-run the same 45-pair test and report the new result plainly, per this project's own "don't keep
 tweaking without reporting real results" discipline.
+
+## Reimplementation: Step 4 retest after real-mask + real-contrast-enhancement fixes -- still fails (2026-09-16)
+
+Status: Wired in the real, CONFIRMED `focal_segment_by_local_variance` (validity mask) and
+`focal_local_contrast_enhance` (pre-binarization enhancement) from `focal_match.c`, replacing the crude
+local-mean-threshold placeholders used in the first attempt. Re-ran the same 45-pair test. Reporting plainly:
+**still does not separate same-finger from different-finger.**
+
+### Result pattern (not just "still overlapping" -- a specific, informative pattern)
+Scores compressed into a lower range overall (~0.49-0.84, down from ~0.75-0.93), but same1-4 now cluster
+uniformly LOW (~0.49-0.70) against EVERYTHING (both same and different finger), while same5/same6 cluster
+uniformly HIGH (~0.58-0.84) against EVERYTHING, again regardless of same/different finger. Example:
+same5-vs-same6 (same finger) = 0.8396, but same6-vs-diff1 (different finger) = 0.7986 -- barely lower, and
+same1-vs-same2 (same finger) = 0.5010, LOWER than several different-finger pairs involving same5/6. This
+pattern -- certain CAPTURES scoring high/low against everything regardless of true finger identity -- points
+to a per-capture confound (e.g. inconsistent feature detection/description quality, or a systematic issue in
+Step 2/3 affecting some captures more than others) rather than the final scoring formula/mask/binarization
+being the dominant remaining problem, since fixing those (this update) barely changed the qualitative pattern.
+
+### Honest assessment of remaining validation options
+This project's own methodology calls for validating a reimplemented stage against the real `.so`'s actual
+intermediate output (e.g. via `gdb`) rather than guessing at parameters -- but the user has already explicitly
+declined calling into the real `.so` at runtime even for "quick validation only, never shipped" (see the
+earlier STEP 3 decision: "reimplement cleanly, preserve zero-dependency goal", explicitly not the "quick
+validation first" option). That option remains off the table for this reason, not forgotten. Remaining
+legitimate validation paths: (a) construct synthetic test images with known, designed structure to check
+`focal_sift.c`'s keypoint localization/orientation behaves sanely on controlled input, (b) audit
+`focal_sift.c` against the OpenSIFT reference line-by-line for logic bugs (distinct from parameter-guessing --
+this is checking the ALREADY-confirmed-correct reference was translated correctly), (c) reconsider whether
+default `octaves=3` (a guess, never extracted from the real binary) and the RANSAC/candidate thresholds
+(also guesses) are reasonable for a 64x80 sensor, informed by the specific per-capture-cluster failure pattern
+observed rather than blind sweeping.
+
+### Not chasing this further by blind parameter tweaking, per this project's own established discipline
+Consistent with the lesson already learned earlier this session (the original NCC-correlation dead end): not
+continuing to adjust thresholds speculatively without a new diagnostic. Logging this honestly as the current
+state of the reimplementation and flagging concretely which of the three validation paths above is worth
+pursuing next, for the next work session.

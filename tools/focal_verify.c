@@ -25,6 +25,11 @@
 
 typedef struct { float x, y, ori; unsigned int desc[8]; } FocalFeature;
 extern int focal_hamming_distance(const unsigned int a[8], const unsigned int b[8]);
+/* CONFIRMED real segmentation primitive (focal_match.c) -- foreground/
+ * background mask via local variance thresholding + erode/dilate. */
+extern int focal_segment_by_local_variance(const unsigned char *src, int rows, int cols,
+                                            int ksize, float thr, unsigned char *dst);
+extern int focal_local_contrast_enhance(unsigned char *src, int rows, int cols, int ksize);
 
 typedef struct { double a, b, c, d, e, f; } Affine2D; /* x'=a*x+b*y+e; y'=c*x+d*y+f */
 
@@ -267,13 +272,25 @@ float focal_verify_two_templates(const FocalFeature *A, int na, const unsigned c
     int n = rows * cols;
     unsigned char *maskA = malloc((size_t)n), *maskB = malloc((size_t)n);
     unsigned char *binA = malloc((size_t)n), *binB = malloc((size_t)n);
-    /* BEST-EFFORT stand-ins: real segmentation (focal_segment_by_local_
-     * variance) and binarization not wired in here yet -- using a plain
-     * local-mean threshold for both mask and bin as a first pass. */
-    binarize_local_mean(imgA, rows, cols, 9, maskA);
-    binarize_local_mean(imgA, rows, cols, 5, binA);
-    binarize_local_mean(imgB, rows, cols, 9, maskB);
-    binarize_local_mean(imgB, rows, cols, 5, binB);
+    unsigned char *enhA = malloc((size_t)n), *enhB = malloc((size_t)n);
+    /* Real segmentation for the validity mask (fixes the earlier crude
+     * local-mean-threshold placeholder, which classified ~50% of any
+     * image -- including pure background -- as "valid"). Threshold value
+     * not independently confirmed from disassembly; chosen empirically
+     * to give a plausible-looking foreground fraction, see PROTOCOL.md. */
+    focal_segment_by_local_variance(imgA, rows, cols, 9, 12.0f, maskA);
+    focal_segment_by_local_variance(imgB, rows, cols, 9, 12.0f, maskB);
+
+    /* Real local-contrast enhancement (CONFIRMED, focal_match.c) before
+     * binarizing, so ridge structure is pronounced/consistent rather than
+     * thresholding the raw percentile-normalized capture directly. */
+    memcpy(enhA, imgA, (size_t)n);
+    memcpy(enhB, imgB, (size_t)n);
+    focal_local_contrast_enhance(enhA, rows, cols, 9);
+    focal_local_contrast_enhance(enhB, rows, cols, 9);
+    binarize_local_mean(enhA, rows, cols, 5, binA);
+    binarize_local_mean(enhB, rows, cols, 5, binB);
+    free(enhA); free(enhB);
 
     int overlap;
     float score = calc_sim_score(maskA, binA, maskB, binB, rows, cols, &H, &overlap);
