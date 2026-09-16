@@ -55,7 +55,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s file1.raw file2.raw [file3.raw ...]\n", argv[0]);
         return 1;
     }
-    const int rows = 80, cols = 64, octaves = 3;
+    const int rows = 80, cols = 64, octaves = 4;
     int n = argc - 1;
     unsigned char **imgs = calloc((size_t)n, sizeof(unsigned char *));
     FocalFeature **feats = calloc((size_t)n, sizeof(FocalFeature *));

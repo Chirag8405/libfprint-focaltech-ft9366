@@ -71,7 +71,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <capture.raw> <ground_truth_real.txt>\n", argv[0]);
         return 1;
     }
-    const int rows = 80, cols = 64, octaves = 3;
+    const int rows = 80, cols = 64, octaves = 4;
     unsigned char *img = load_raw_be16_as_u8(argv[1], rows * cols);
     FocalFeature *mine;
     int nMine = focal_extract_features(img, rows, cols, octaves, &mine);

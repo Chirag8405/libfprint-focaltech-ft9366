@@ -37,7 +37,7 @@ static unsigned char *load_raw_be16_as_u8(const char *path, int npix)
 
 int main(int argc, char **argv)
 {
-    const int rows=80, cols=64, octaves=3;
+    const int rows=80, cols=64, octaves=4;
     for (int a = 1; a < argc; a++) {
         unsigned char *img = load_raw_be16_as_u8(argv[a], rows*cols);
         FocalFeature *f;

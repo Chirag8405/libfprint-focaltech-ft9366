@@ -3069,3 +3069,40 @@ independently verified this session (the isolated test manually forced octave=1,
 Not yet resolved -- flagged plainly rather than claimed fixed, per this session's own rules. Both fixes are
 kept (they are independently proven correct against real data), and this remaining gap is the next thing to
 investigate if the full 45-pair test below doesn't show clean separation.
+
+## Full 45-pair test after both confirmed descriptor fixes -- separation STILL does not work (2026-09-16)
+
+Status: TESTED, reporting honestly. Both descriptor fixes (ori+PI rotation, comparison operator flip) are
+independently CONFIRMED correct against real ground truth (29/256 Hamming on a known keypoint using oracle
+x/y/ori/octave). Re-ran the full 45-pair same/different-finger dataset through the corrected pipeline anyway,
+per Step 4's instruction. Result:
+```
+same-finger:      n=15  avg=0.7088  min=0.4863  max=0.8583
+same-vs-different: n=24  avg=0.7116  min=0.4905  max=0.8538
+different-vs-different: n=6  avg=0.7100  min=0.6209  max=0.7652
+```
+**All three distributions are now nearly IDENTICAL in mean (0.7088/0.7116/0.7100) and heavily overlapping.**
+No separation. This is a different failure signature than before this session's fixes (previously
+different-finger scored highest on average; now all three categories are statistically indistinguishable) --
+but still not a working matcher by any measure.
+
+### Honest reconciliation with the confirmed single-keypoint fix
+This is not a contradiction: the isolated test proved `compute_binary_descriptor` is correct GIVEN a correct
+octave/interval/orientation as input (it was fed the real algorithm's own x/y/ori and a manually-chosen
+octave=1). The full pipeline result shows that OUR OWN detection pipeline's assigned orientation and/or
+octave/interval for a given keypoint still differs from what the real algorithm would assign for the same
+physical point, often enough to matter -- consistent with the earlier-flagged, not-yet-resolved caveat (this
+session's own diff_ground_truth2 aggregate test showed ~142/256 average Hamming even restricted to keypoints
+where OUR position agrees to <1px and OUR own orientation agrees with a REAL keypoint's orientation to
+<0.02rad, which did not improve after the two confirmed fixes). The two fixes are real and are being kept
+(they are the correct behavior for compute_binary_descriptor itself), but they do not fully explain the
+separation failure alone -- there remains at least one more issue, most likely in orientation assignment
+(`calc_feature_oris`) or octave/interval assignment consistency, not yet isolated with the same rigor applied
+to the descriptor-sampling stage this session.
+
+### Next concrete action
+Apply the SAME ground-truth-diffing methodology used successfully this session (reproduce real intermediate
+values, diff, localize precisely) to the ORIENTATION ASSIGNMENT stage specifically -- extract real ground
+truth for a keypoint's orientation histogram or the octave/interval the real algorithm assigns it, and compare
+against `calc_feature_oris`'s own output for the same detected position, rather than continuing to test the
+full pipeline's aggregate behavior.
