@@ -184,3 +184,126 @@ CMD_READ_CHIPID:
 3. Map the command immediately following the first successful wake response and identify where chipid traffic begins.
 4. Locate key material/derivation around `PK11_ImportSymKey` in decompiler (Ghidra/r2) once tools are available.
 5. Build driver state machine around: open -> init/wake -> chipid -> crypto init -> event loop -> enroll/verify.
+
+## Update: rts5811_init_chip traced (2026-09-16)
+
+Status: CONFIRMED (static disassembly), tested against real hardware (live session)
+
+### Wake sequence confirmed working at the wire level
+Standalone libusb test tool: `tools/rts5811_wake_test.c`
+
+- Bulk OUT `4c 5a 01 00` on EP 0x01 -> Bulk IN 4 bytes on EP 0x82.
+- CONFIRMED: real hardware responds immediately and consistently with `04 00 00 04` on every attempt (10/10 in testing).
+- This is a real, reproducible response, in contrast to total silence previously observed for the generic `0xa5` CMD_INIT sent alone.
+- Decode logic for the response (traced from `_Z25ft_tell_mcu_capture_starth`): resp[2]==0x02 -> retry (loop); else -> proceed. Our `04 00 00 04` response decodes to "proceed" (resp[3]==0x04 branch), confirmed via corrected disassembly reading (see below -- initial reading of the branch direction was backwards and has been corrected).
+
+### rts5811_init_chip traced -- NOT a separate protocol
+
+`_ZL17rts5811_init_chipP19rts5811_dev_info_st` (address `0x14d471`):
+
+```
+rts5811_init_chip(dev_info_st *info):
+  if (info != NULL):
+    info->field_0x0 = 0x40
+    info->field_0x2 = 0x50
+    info->field_0x4 = 0x9366   ; chip id literal
+  call usb_fw9366_init_chip()  ; <-- SAME function already traced (SensorReset -> sleep(100ms) -> fw9366_init_chip)
+  return 0
+```
+
+CONFIRMED: `rts5811_init_chip` is a thin wrapper that just stashes some static device-info fields (0x40, 0x50, chip id 0x9366) and then calls the exact same `usb_fw9366_init_chip()` path already traced. It is NOT a different/superset protocol. The earlier working theory ("rts5811_init_chip might use a distinct command set") is now RULED OUT.
+
+### Result of testing full precondition sequence against real hardware
+
+Sequence tested: wake ping (`4c 5a 01 00`, proceed confirmed) -> sleep(10ms) -> write `44 80 00 00` -> sleep(30ms) -> sleep(100ms) -> generic FocalTech CMD_INIT (`02 00 01 a5 a4`).
+
+Result: CMD_INIT still times out with zero response (`LIBUSB_ERROR_TIMEOUT`), even after the full confirmed-working wake sequence.
+
+### Open question (not yet resolved)
+
+Since `rts5811_init_chip` -> `usb_fw9366_init_chip` -> `fw9366_init_chip()` is the one and only code path (no alternate RTS5811-specific protocol exists), the real next step is to disassemble `fw9366_init_chip()` itself (address `0x15265b`) directly to find the actual command bytes it sends after `SensorReset()` returns -- rather than assuming it is the same generic `0xa5` envelope that mainline's `focaltech_moc` driver uses for native-USB sibling chips. That assumption has not been directly verified from disassembly and may be wrong.
+
+## Update: fw9366_init_chip traced -- generic 0xa5 envelope conclusively ruled out (2026-09-16)
+
+Status: CONFIRMED (static disassembly)
+
+`fw9366_init_chip()` (address `0x15265b`) does:
+1. Retry loop calling `ft_tell_mcu_capture_start(1)` (same wake ping already confirmed working) until it returns != 1.
+2. `fw9366_Get_OTP_Info(NULL, 0)`
+3. `fw9366_get_SMIC_IC_flag()`
+4. `fw9366_init_flag()`
+5. `fw9366_intflag_clear(0xffff)`
+6. `fw9366_cfg_init()`
+7. `fw9366_Update_Base()`
+8. `fw9366_fdt_auto_start(1)`
+9. Direct writes: `REG9366[0x88] = 0`, `REG9366[0x8a] = 0`
+10. `fw9366_poa_send_para(1)`
+
+CONFIRMED: there is no call anywhere in this function (or in `rts5811_init_chip`, which just wraps it) to the generic FocalTech command envelope (`focaltech_moc_compose_cmd`-style magic/len/code/bcc framing, e.g. the `0xa5` CMD_INIT). The working theory from the previous session -- that mainline's generic FocalTech protocol is the wrong path for this RTS5811-bridged chip -- is now CONFIRMED, not just suspected. Do not spend further time trying variations of the `0xa5`-style envelope; it is not part of this chip's real protocol.
+
+## Update: fw9366_poa_send_para inspected -- payload depends on unreplicated prior state (2026-09-16)
+
+Status: CONFIRMED (static disassembly), NOT tested against hardware (would be meaningless without prior stages)
+
+`fw9366_poa_send_para` is the first function in the `fw9366_init_chip` chain confirmed to call `ff_spi_write_then_read_buf_rts` (the same low-level SPI-bridge transfer helper already used for the wake ping). However, its outgoing payload buffer is assembled from live global state, not constants:
+- Bytes copied from `REG9366` global struct at offsets including `0x87`, `0x89`, `0xa6`, `0xa8`, `0xaa`, `0xac`, `0xba`, `0xbc`, `0xbe`, `0xc0`
+- Bytes copied from `Fw9366_cfg` global struct (offset `0xc`)
+- A byte from global `smic_flag`
+
+These globals are populated by the FOUR functions that run before `poa_send_para` in the real sequence: `fw9366_cfg_init`, `fw9366_Update_Base`, `fw9366_get_SMIC_IC_flag`, `fw9366_fdt_auto_start`. None of these four has been traced yet. Sending `poa_send_para`'s command in isolation (without replicating those four first) would send a garbage/zeroed payload and any hardware response (or lack of one) would not be meaningful -- explicitly NOT tested for this reason.
+
+## Honest scope assessment (2026-09-16)
+
+The real FT9366/RTS5811 init protocol is a genuine multi-stage sequence, not a single command. Full replication requires tracing at minimum:
+- `fw9366_cfg_init` (~456 bytes disassembled)
+- `fw9366_Update_Base` (~601 bytes)
+- `fw9366_get_SMIC_IC_flag` (~628 bytes)
+- `fw9366_fdt_auto_start` (~863 bytes)
+- `fw9366_poa_send_para` (~733 bytes, already partially inspected above)
+
+This likely also requires understanding the large embedded calibration/config binary blob visible via `strings` on the same .so (see earlier `binary_analysis.md` notes) since `fw9366_cfg_init`/`fw9366_Update_Base` are the most likely consumers of that data. This is realistically multiple more hours of focused disassembly work, not a same-session fix. Confirmed working building blocks so far (safe to build on in a future session): the wake ping sequence and its response-decode logic (see `tools/rts5811_wake_test.c`), and the definitive ruling-out of the generic FocalTech `0xa5` envelope for this specific chip variant.
+
+## Update: fw9366_cfg_init traced -- no USB traffic, pure local config (2026-09-16)
+
+Status: CONFIRMED (static disassembly). No hardware test possible/meaningful for this function alone (it sends nothing).
+
+`fw9366_cfg_init()` (address `0x155566`, ~456 bytes disassembled including debug logging) performs **zero USB communication**. It only writes constants into the global `Fw9366_cfg` struct (base `0x30ded60`). Full decoded layout:
+
+```
+Fw9366_cfg[0x0] = 0x78
+Fw9366_cfg[0x1] = 0x01
+Fw9366_cfg[0x2] = 0x01
+Fw9366_cfg[0x3] = 0x3c
+Fw9366_cfg[0x4] = 0xc8
+  ; branch reads Fw9366_cfg[0x2], which was just set to 0x01 above, so the
+  ; "true" branch always executes in practice (the else branch at the
+  ; disassembly level is statically dead given this code path):
+Fw9366_cfg[0x5] = 0x04
+Fw9366_cfg[0x6] = 0x04
+Fw9366_cfg[0x7] = 0x32
+Fw9366_cfg[0x8] = 0x2d
+Fw9366_cfg[0x9] = 0x01
+Fw9366_cfg[0xa] = 0x02
+  ; only real data-dependent branch in this function:
+if (smic_flag == 0xaa):
+  Fw9366_cfg[0xc..0xd] (u16, LE) = 0x0096
+else:
+  Fw9366_cfg[0xc..0xd] (u16, LE) = 0x00c8
+Fw9366_cfg[0xe] = 0x02
+Fw9366_cfg[0xf] = 0x32
+Fw9366_cfg[0x10] = 0x05
+Fw9366_cfg[0x11] = 0x08
+```
+
+### Answers to open questions
+
+- **Fixed sequence vs. calibration blob:** Fixed. This function does not read the large embedded binary blob seen in earlier `strings` analysis -- that blob (if used at all) must be consumed by a different function (`fw9366_Update_Base` and/or `fw9366_fdt_auto_start`, not yet traced).
+- **Device-specific vs. generic:** Generic. Every byte here is a hardcoded constant except the one `smic_flag`-dependent field, and `smic_flag` reads as a foundry/IC-variant selector (SMIC = a chip foundry), not a per-unit serial or calibration value. This output should be identical for every FT9366 unit of the same foundry variant -- safe to hardcode/reuse/share.
+- **Dependency on `rts5811_init_chip`:** None. `rts5811_init_chip` only writes to a separate `rts5811_dev_info_st` struct (`0x40`/`0x50`/`0x9366`), which `cfg_init` never reads. The only real dependency is on `smic_flag`, set by `fw9366_get_SMIC_IC_flag()` (the function called immediately before `cfg_init` in `fw9366_init_chip`'s real sequence) -- not yet traced. Its value is currently unknown, so the branch outcome above is undetermined until that function is traced.
+
+### Test tool status
+
+`tools/rts5811_wake_test.c` extended to compute and print the `Fw9366_cfg` struct locally (both branches, since `smic_flag` is not yet known). No new bytes are sent to hardware by this step -- there is nothing to test yet, since `cfg_init` itself never touches the USB device. This is local scaffolding for the later `poa_send_para` step, not a hardware result.
+
+### Next concrete action
+Trace `fw9366_get_SMIC_IC_flag()` (~628 bytes) next, both to resolve the `smic_flag` branch above and because it is the next function in the real call order (`fw9366_init_chip` calls it before `cfg_init`). Likely candidate for the first *real* USB traffic beyond the wake ping, since "get flag" implies reading something back from the device/OTP.

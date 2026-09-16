@@ -102,16 +102,59 @@ int main(void)
     usleep(30 * 1000);
     usleep(100 * 1000);
 
-    printf("\n== step 5: send CMD_INIT (02 00 01 a5 a4), same as mainline focaltech_moc driver ==\n");
+    printf("\n== step 5 [RULED OUT, kept only for regression reference]: generic FocalTech\n");
+    printf("   CMD_INIT (02 00 01 a5 a4) -- traced disassembly confirms fw9366_init_chip()\n");
+    printf("   never sends this envelope at all. Expect a timeout below; this is not a bug. ==\n");
     unsigned char cmd_init[5] = { 0x02, 0x00, 0x01, 0xa5, 0xa4 };
     bulk_write(h, cmd_init, sizeof(cmd_init));
     unsigned char final_resp[64];
     int fr = bulk_read(h, final_resp, sizeof(final_resp));
     if (fr == 0) {
-        printf("\n*** GOT A RESPONSE TO CMD_INIT! Precondition sequence worked. ***\n");
+        printf("\n*** UNEXPECTED: got a response to the ruled-out CMD_INIT. Re-open the investigation. ***\n");
     } else {
-        printf("\n*** Still no response to CMD_INIT after precondition sequence. ***\n");
+        printf("\n*** Timed out as expected -- confirms prior finding, not a new result. ***\n");
     }
+
+    /* --- fw9366_cfg_init() reimplementation ---
+     * Traced from static disassembly (address 0x155566 in the proprietary
+     * .so). This function sends NOTHING to the device -- it only computes
+     * host-side config state later consumed by fw9366_poa_send_para. There
+     * is no hardware transfer here, so this section is local-only and
+     * cannot produce a device response. smic_flag is not yet known (it's
+     * set by fw9366_get_SMIC_IC_flag, not yet traced), so both branches are
+     * printed for reference. */
+    printf("\n== fw9366_cfg_init() local state (NOT a hardware test -- this function sends nothing) ==\n");
+    unsigned char fw9366_cfg[0x12];
+    memset(fw9366_cfg, 0, sizeof(fw9366_cfg));
+    fw9366_cfg[0x0] = 0x78;
+    fw9366_cfg[0x1] = 0x01;
+    fw9366_cfg[0x2] = 0x01;
+    fw9366_cfg[0x3] = 0x3c;
+    fw9366_cfg[0x4] = 0xc8;
+    /* Fw9366_cfg[0x2] == 0x01 (just set above) so this branch always taken */
+    fw9366_cfg[0x5] = 0x04;
+    fw9366_cfg[0x6] = 0x04;
+    fw9366_cfg[0x7] = 0x32;
+    fw9366_cfg[0x8] = 0x2d;
+    fw9366_cfg[0x9] = 0x01;
+    fw9366_cfg[0xa] = 0x02;
+    fw9366_cfg[0xe] = 0x02;
+    fw9366_cfg[0xf] = 0x32;
+    fw9366_cfg[0x10] = 0x05;
+    fw9366_cfg[0x11] = 0x08;
+
+    unsigned char fw9366_cfg_smic_aa[0x12];
+    memcpy(fw9366_cfg_smic_aa, fw9366_cfg, sizeof(fw9366_cfg));
+    fw9366_cfg_smic_aa[0xc] = 0x96; fw9366_cfg_smic_aa[0xd] = 0x00;
+
+    unsigned char fw9366_cfg_smic_other[0x12];
+    memcpy(fw9366_cfg_smic_other, fw9366_cfg, sizeof(fw9366_cfg));
+    fw9366_cfg_smic_other[0xc] = 0xc8; fw9366_cfg_smic_other[0xd] = 0x00;
+
+    hexdump("  Fw9366_cfg if smic_flag==0xaa   ", fw9366_cfg_smic_aa, sizeof(fw9366_cfg_smic_aa));
+    hexdump("  Fw9366_cfg if smic_flag!=0xaa   ", fw9366_cfg_smic_other, sizeof(fw9366_cfg_smic_other));
+    printf("  (smic_flag itself is not yet known -- depends on fw9366_get_SMIC_IC_flag,\n");
+    printf("   not yet traced. No hardware bytes were sent for this step.)\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);
