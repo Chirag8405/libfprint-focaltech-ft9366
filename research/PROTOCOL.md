@@ -2918,3 +2918,39 @@ OpenSIFT's `atan2(dy,dx)`-with-y-flip (a classic image-row-vs-math-Y-axis source
 confusion), every sampled point would be reflected to the WRONG side of the keypoint even with perfectly
 correct position/orientation -- consistent with the observed worse-than-random Hamming distances at exact
 position+orientation matches. Testing this directly next.
+
+## Three descriptor-bug hypotheses tested against ground truth, all ruled out (2026-09-16)
+
+Status: TESTED, precise numbers reported plainly. None of the three most plausible hypotheses for the
+descriptor discrepancy improved results meaningfully -- all land in the same ~126-160/256 range, statistically
+indistinguishable from the ~128 random-chance baseline.
+
+Using `tools/diff_ground_truth2.c` (isolates descriptor-only error: only compares pairs with position
+agreement <1px AND orientation agreement <0.1rad against real ground truth, n=21 such tight matches on
+same5.raw):
+```
+baseline (current ccw rotation, gauss_pyr[octv][intvl] sampling, samples[0..44]=coordinarePairs[0..44]):
+  avg Hamming = 145.6/256
+Hypothesis 1 -- rotation direction (cw instead of ccw):                    220.8/256 (WORSE)
+Hypothesis 1b -- swapped x/y in rotation formula:                          127.9/256 (no real improvement)
+Hypothesis 1c -- no rotation at all:                                       158.3/256 (no improvement)
+Hypothesis 2 -- sample from fixed gauss_pyr[0][0] instead of [octv][intvl]: 144.7/256 (no improvement)
+Hypothesis 3 -- skip coordinarePairs[0], add implicit center sample:        143.3/256 (no improvement)
+```
+None of these moved meaningfully off the random-chance baseline. This rules out (at least these specific
+forms of) rotation-direction sign errors, wrong-pyramid-level sampling, and the previously-flagged 44-vs-45
+sample indexing ambiguity as standalone explanations.
+
+### Honest assessment
+The bug is real and precisely localized to descriptor computation (previous entry: near-exact position+
+orientation matches still produce high Hamming distance), but its exact nature remains unresolved after three
+concrete, well-motivated attempts. Plausible remaining explanations, not yet tested: (a) the `ModePairs`
+comparison itself may not be a simple `sample[a] < sample[b]` (e.g. could involve a threshold/margin, gradient
+rather than raw intensity, or normalization against a local reference), (b) `coordinarePairs`' units/scale
+might not be plain pixels at the sampled octave (e.g. could need scaling by `scl_octv` after all, contrary to
+the earlier reasoned-but-unconfirmed dismissal of that idea -- worth revisiting now that simpler hypotheses
+failed), (c) the orientation angle itself, despite the <0.1 rad filter, might have a subtle systematic
+reference/sign difference not caught by this filter's tolerance. Getting further ground truth on this specific
+question would most reliably come from extracting the real algorithm's intermediate SAMPLE VALUES (not just
+the final descriptor) at a known keypoint -- a more invasive extraction than what's been done so far, not yet
+attempted.
