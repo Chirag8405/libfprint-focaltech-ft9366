@@ -114,6 +114,63 @@ static int sram_read(libusb_device_handle *h, unsigned short addr, unsigned shor
     return 0;
 }
 
+/* fw9366_sfr_read(reg), traced at 0x165f86 (used earlier inline for the
+ * smic_flag loop; factored out here as a reusable helper now that more
+ * callers need it). */
+static int sfr_read(libusb_device_handle *h, unsigned char reg, unsigned char *out)
+{
+    unsigned char cmd[5] = { 0x08, 0xf7, reg, 0x00, 0x00 };
+    unsigned char resp[1] = { 0 };
+    int wr = bulk_write(h, cmd, sizeof(cmd));
+    int rr = bulk_read(h, resp, sizeof(resp));
+    if (wr != 0 || rr != 0) return -1;
+    *out = resp[0];
+    return 0;
+}
+
+/* FW9366_WorkMode_Cmd table, extracted directly from .rodata at 0x1c88c0
+ * (3 bytes per mode, modes 0-11). Mode 11 sends only 1 byte; all others
+ * send all 3. */
+static const unsigned char FW9366_WorkMode_Cmd[12][3] = {
+    { 0xc0, 0x3f, 0x00 }, { 0xc1, 0x3e, 0x00 }, { 0xc2, 0x3d, 0x00 }, { 0xc4, 0x3b, 0x00 },
+    { 0xc8, 0x37, 0x00 }, { 0xd8, 0x27, 0x00 }, { 0xd1, 0x2e, 0x00 }, { 0xd2, 0x2d, 0x00 },
+    { 0xd4, 0x2b, 0x00 }, { 0x5a, 0xa5, 0x00 }, { 0xa5, 0x5a, 0x00 }, { 0x70, 0x00, 0x00 },
+};
+
+/* fw9366_wm_switch(mode), traced at 0x165d48: table lookup + write-only
+ * send, 3 bytes for modes 0-10, 1 byte for mode 11. */
+static int wm_switch(libusb_device_handle *h, int mode)
+{
+    if (mode < 0 || mode > 11) return -1;
+    int len = (mode == 11) ? 1 : 3;
+    return bulk_write(h, FW9366_WorkMode_Cmd[mode], len);
+}
+
+/* fw9366_wm_get(), traced at 0x154c3b: sfr_read(0x80). */
+static int wm_get(libusb_device_handle *h, unsigned char *out)
+{
+    return sfr_read(h, 0x80, out);
+}
+
+/* fw9366_idle_enter(), traced at 0x154c5a: fully self-contained, built
+ * entirely on wm_switch/wm_get -- no unresolved dependencies. */
+static int idle_enter(libusb_device_handle *h)
+{
+    printf(" idle_enter(): wm_switch(9)\n");
+    wm_switch(h, 9);
+    unsigned char wm = 0;
+    printf(" idle_enter(): wm_get()\n");
+    wm_get(h, &wm);
+    printf("  wm_get() = 0x%02x\n", wm);
+    if (wm != 0x50) {
+        printf(" idle_enter(): wm != 0x50, wm_switch(0)\n");
+        wm_switch(h, 0);
+    }
+    printf(" idle_enter(): wm_switch(0xa)\n");
+    wm_switch(h, 0xa);
+    return 0;
+}
+
 int main(void)
 {
     libusb_context *ctx = NULL;
@@ -309,6 +366,44 @@ int main(void)
     } else {
         printf("\n== chipid sram_read transfer failed/timed out ==\n");
     }
+
+    /* --- fw9366_fdt_mode_init() -- OPENING SEQUENCE ONLY, traced from
+     * 0x155f7d (8870 bytes total, only the first ~40% covered). This is
+     * called from fw9366_fdt_manual_start(), which is called from
+     * fw9366_fdt_base_Stable_Update() (part of fw9366_Update_Base's call
+     * tree). Confirmed opening sequence:
+     *   fw9366_idle_enter()                          -- fully resolved, tested below
+     *   if (REG9366[0x77]==0) fw9366_img_mode_init(0) -- REG9366[0x77] IS 0 per
+     *       fw9366_init_flag (already confirmed), so this call WILL happen in
+     *       the real sequence, but img_mode_init itself (3074 bytes) has NOT
+     *       been traced yet -- deliberately NOT called here, see note below.
+     *   sram_write(0x1801, sram_bits_set(0xfc80, hi=6, lo=0, new=REG9366[0x89]))
+     *     = sram_write(0x1801, 0xfc9b)  -- REG9366[0x89]=0x1b confirmed via
+     *       fw9366_init_flag (Fw9366_cfg[2]=1 branch, already traced)
+     *   sram_write(0x1881, sram_bits_set(sram_bits_set(0, hi=15,lo=8,new=15),
+     *                                     hi=4,lo=2,new=3))
+     *     = sram_write(0x1881, 0x0f0c)  -- period=1000/Fw9366_cfg[3]-1=15
+     *       (Fw9366_cfg[3]=0x3c confirmed), Fw9366_cfg[5]-1=3 (cfg[5]=0x04
+     *       confirmed); fw9366_context[0xf8] confirmed NEVER written anywhere
+     *       in this binary (permanently 0 from .bss), so the Fw9366_cfg[3]
+     *       path (not [4]) is confirmed taken, not assumed.
+     *
+     * NOT testing further into fdt_mode_init from here: the function calls
+     * fw9366_img_mode_init(0) BEFORE these sram_writes in the real sequence,
+     * and skipping it would make this test diverge from the real init order.
+     * img_mode_init is untraced (3074 bytes) -- this is the actual next
+     * concrete blocker, not scope size alone: correctly continuing requires
+     * either tracing it or accepting a test that's known to skip a required
+     * real step. Reporting both pieces honestly rather than merging them. */
+    printf("\n== fw9366_fdt_mode_init() OPENING SEQUENCE (partial -- see comments) ==\n");
+    printf("-- idle_enter() --\n");
+    idle_enter(h);
+    printf("-- [NOT CALLED: fw9366_img_mode_init(0) -- untraced, 3074 bytes; REG9366[0x77]==0 so real driver WOULD call this here] --\n");
+    printf("-- sram_write(0x1801, 0xfc9b) [fully resolved value, see comment above] --\n");
+    sram_write(h, 0x1801, 0xfc9b);
+    printf("-- sram_write(0x1881, 0x0f0c) [fully resolved value, see comment above] --\n");
+    sram_write(h, 0x1881, 0x0f0c);
+    printf("\n== NOTE: this is a PARTIAL, out-of-order test (img_mode_init skipped) -- report is for wire-level sanity (do the writes complete cleanly) only, not for \"is fdt_mode_init working\" ==\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);

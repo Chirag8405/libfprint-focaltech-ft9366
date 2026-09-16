@@ -500,3 +500,73 @@ Every single command attempted against real hardware in this session has worked 
 
 ### Next concrete action
 Continue the `fw9366_init_chip` chain: `fw9366_Update_Base()` (~601 bytes, not yet traced) is next. Given the strong track record so far, also worth checking whether `ft_feature_devinit_JudgeByChipId`'s two mystery byte sequences (`06 f9 00` / `11 ee 02 00`) correspond to a THIRD command opcode family, since `06 f9` and `04 fb`/`05 fa`/`08 f7`/`09 f6` all share the "byte0 < 0x10, byte1 in 0xf0-0xff range" pattern -- possibly worth a quick side-check.
+
+## Update: fw9366_Update_Base chain started -- idle_enter confirmed, fdt_mode_init opening resolved (2026-09-16)
+
+Status: CONFIRMED primitives tested clean; fdt_mode_init itself only ~40% traced (large function, see honest scope note below)
+
+### Call chain confirmed (structural, from disassembly)
+```
+fw9366_Update_Base()
+  fw9366_fdt_base_Stable_Update(h)
+    fw9366_fdt_block()          -- local only (returns 4, since Fw9366_cfg[2]=1 confirmed)
+    fw9366_fdt_AutoSDacUpdate()  -- no direct SFR/SRAM calls of its own; calls
+                                    fdt_manual_start + fdt_get_a_frame_data + local DAC math
+    fw9366_fdt_manual_start()
+      fw9366_fdt_mode_init()    -- LARGE (8870 bytes), only opening traced so far
+      ... (SRAM state machine, sram_bits_set, wm_switch(2), poll loop on intflag)
+    fw9366_fdt_get_a_frame_data() -- not yet traced
+    fw9392_fdt_base_fail_check()  -- not yet traced
+    fw9366_fdt_base_Min_Updata()  -- not yet traced
+  fw9366_img_base_Update(h)       -- separate large tree, not yet traced (img_data_get,
+                                      calculate_crc, find_max_min_avg_1218, AutoSDacUpdate)
+```
+
+### NEW confirmed primitives (all tested live, zero timeouts)
+
+`fw9366_wm_switch(mode)` (0x165d48): table lookup in `FW9366_WorkMode_Cmd` (.rodata @ 0x1c88c0, 3 bytes/mode, 12 modes) + write-only bulk OUT (3 bytes for modes 0-10, 1 byte for mode 11, via `ff_spi_write_buf_rts`). Full table extracted:
+
+```
+mode 0: c0 3f 00   mode 1: c1 3e 00   mode 2:  c2 3d 00   mode 3: c4 3b 00
+mode 4: c8 37 00   mode 5: d8 27 00   mode 6:  d1 2e 00   mode 7: d2 2d 00
+mode 8: d4 2b 00   mode 9: 5a a5 00   mode 10: a5 5a 00   mode 11: 70 (1 byte only)
+```
+
+`fw9366_wm_get()` (0x154c3b) = `sfr_read(0x80)`.
+
+`fw9366_idle_enter()` (0x154c5a) -- fully self-contained, no unresolved deps:
+```
+wm_switch(9)
+wm = wm_get()
+if wm != 0x50: wm_switch(0)
+wm_switch(0xa)
+```
+
+LIVE TEST: `wm_switch(9)` sent (`5a a5 00`), `wm_get()` returned **exactly 0x50** (matching the real driver's own check value -- the "not equal, do fallback reset" branch was correctly NOT triggered, a meaningful positive signal, not just "no timeout"), `wm_switch(0xa)` sent (`a5 5a 00`). Fallback `wm_switch(0)` correctly skipped since wm==0x50.
+
+### fw9366_fdt_mode_init opening sequence -- resolved and tested (partial function)
+
+First ~40% of this 8870-byte function traced. Confirmed opening logic:
+```
+fw9366_idle_enter()
+if (REG9366[0x77] == 0): fw9366_img_mode_init(0)   -- REG9366[0x77]=0 confirmed via
+    already-traced fw9366_init_flag -- this call WILL happen in the real sequence
+sram_write(0x1801, sram_bits_set(0xfc80, hi=6, lo=0, new=REG9366[0x89]))
+  = sram_write(0x1801, 0xfc9b)   -- REG9366[0x89]=0x1b confirmed via fw9366_init_flag
+sram_write(0x1881, sram_bits_set(sram_bits_set(0, hi=15,lo=8,new=15), hi=4,lo=2,new=3))
+  = sram_write(0x1881, 0x0f0c)   -- period=1000/Fw9366_cfg[3]-1=15 (cfg[3]=0x3c confirmed),
+    Fw9366_cfg[5]-1=3 (cfg[5]=0x04 confirmed); fw9366_context[0xf8] CONFIRMED (via whole-binary
+    search) never written anywhere -- permanently 0 from .bss -- so the cfg[3] branch (not
+    cfg[4]) is confirmed taken, not assumed.
+```
+
+LIVE TEST: both `sram_write` calls sent cleanly (`05 fa 98 01 00 01 fc 9b` and `05 fa 98 81 00 01 0f 0c`), zero timeouts. **Note: this test deliberately skips `fw9366_img_mode_init(0)`** (untraced, 3074 bytes) which the real sequence calls BEFORE these two writes -- so this is a wire-level sanity check only (do the writes complete cleanly), not a claim that fdt_mode_init as a whole is correctly replicated or "working". Explicitly not overclaiming this.
+
+### Honest scope assessment -- genuine complexity escalation, not a dead end
+
+Everything traced in this phase has resolved deterministically so far (no true dead ends), but the character of the work has changed:
+- `fw9366_img_mode_init` (3074 bytes) -- untraced, required next step, blocks further progress on fdt_mode_init's main body.
+- The remainder of `fdt_mode_init` (~60% untraced) branches on `fw9366_context[0xfc]` (a state machine: 0xa0/0xa1/0xa2) and `AUTO_DAC_PRO_FLAG`/`FW9366_INIT_RE_CHECK` -- both confirmed to be mutable globals written from MULTIPLE call sites, including `fw9366_fdt_AutoSDacUpdate`, which itself calls `fw9366_fdt_manual_start` (hence `fdt_mode_init`) internally, while also being called BEFORE the direct `fdt_manual_start` call in the outer sequence. This means `fdt_mode_init` runs multiple times with different accumulated state depending on call path -- a qualitatively harder problem than tonight's earlier stateless primitives, with real risk of error if hand-traced without a decompiler.
+- Still fully untraced: `fw9366_fdt_get_a_frame_data`, `fw9392_fdt_base_fail_check`, `fw9366_fdt_base_Min_Updata`, and the entire `fw9366_img_base_Update` tree (`fw9366_img_data_get`, `fw9366_calculate_crc`, `find_max_min_avg_1218`, `fw9366_AutoSDacUpdate`) -- likely several thousand more bytes combined.
+
+This is a real, substantial remaining scope -- flagging clearly per session ground rules rather than continuing to push through stateful multi-entry-point logic with lower confidence.
