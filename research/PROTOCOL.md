@@ -570,3 +570,96 @@ Everything traced in this phase has resolved deterministically so far (no true d
 - Still fully untraced: `fw9366_fdt_get_a_frame_data`, `fw9392_fdt_base_fail_check`, `fw9366_fdt_base_Min_Updata`, and the entire `fw9366_img_base_Update` tree (`fw9366_img_data_get`, `fw9366_calculate_crc`, `find_max_min_avg_1218`, `fw9366_AutoSDacUpdate`) -- likely several thousand more bytes combined.
 
 This is a real, substantial remaining scope -- flagging clearly per session ground rules rather than continuing to push through stateful multi-entry-point logic with lower confidence.
+
+## STEP 1 DELIVERABLE: fw9366_fdt_mode_init call-site / state map (2026-09-16)
+
+Status: CONFIRMED (static disassembly, exhaustive whole-binary search for every read/write of every
+relevant global -- not a linear single-path trace). This map was built BEFORE writing any further
+integration code, per session methodology, after catching one real tracing error below.
+
+### All 4 call sites of fw9366_fdt_mode_init in the binary
+
+| # | Call site | Enclosing function | Reachable from real init chain? |
+|---|---|---|---|
+| 1 | 0x15052d | `fw9366_Chip_Paramter_Init` | **NO** -- zero callers anywhere in the binary (confirmed via whole-binary search). Dead/unused path. |
+| 2 | 0x1553af | `fw9366_FDT_ESD_Handle` | **NO** -- only caller is `fw9366_Chip_Paramter_Init` (call site 1), itself unreachable. Dead/unused path. |
+| 3 | 0x158357 | `fw9366_fdt_auto_start` | **YES** -- called directly by `fw9366_init_chip` after `Update_Base` returns (already-confirmed real sequence). |
+| 4 | 0x1586a6 | `fw9366_fdt_manual_start` | **YES** -- reached via TWO different real paths (see below). |
+
+Call sites 1 and 2 are excluded from further analysis -- confirmed unreachable, not guessed.
+
+### The real invocation order and exhaustive state trace
+
+`fw9366_fdt_manual_start` has exactly one call to `fdt_mode_init` (site 4), but is itself called from
+two different places in the real sequence, so site 4 fires twice with different accumulated state:
+
+```
+fw9366_init_chip()
+  fw9366_init_flag()              -- WRITES fw9366_context[0xfc] = 0xa0   (only write outside fdt_mode_init itself
+                                        and the unreachable FDT_ESD_Handle -- confirmed via exhaustive search of
+                                        all 16 load sites of the fw9366_context base address in the whole binary)
+  ... (cfg_init, intflag_clear -- confirmed not touching this state)
+  fw9366_Update_Base()
+    fw9366_fdt_base_Stable_Update()
+      fw9366_fdt_block()          -- no state touch
+      fw9366_fdt_AutoSDacUpdate()
+        [own logic] AUTO_DAC_PRO_FLAG = 1        (0x15885b, BEFORE its internal fdt_manual_start call)
+        fw9366_fdt_manual_start()
+          === INVOCATION A1 === entry state: fw9366_context[0xfc]=0xa0, AUTO_DAC_PRO_FLAG=1,
+              FW9366_LAST_AUTO=0xaa (compiled-in .data default, NOT zero -- confirmed by reading .data bytes)
+        [own logic] AUTO_DAC_PRO_FLAG = 0        (0x158ed7, AFTER, does not affect invocation A1)
+      fw9366_fdt_manual_start()    -- DIRECT call, after AutoSDacUpdate returns
+        === INVOCATION A2 === entry state: fw9366_context[0xfc]=0xa1 (set by A1's own body, see below)
+      fw9366_fdt_get_a_frame_data()  -- no state touch (not in the 16-site list)
+      fw9392_fdt_base_fail_check()   -- no state touch
+      fw9366_fdt_base_Min_Updata()   -- no state touch
+    fw9366_img_base_Update()         -- no state touch (not in the 16-site list)
+  fw9366_fdt_auto_start(1)
+    ... eventually calls fdt_mode_init via call site 3
+        === INVOCATION B === entry state: fw9366_context[0xfc]=0xa1 (unchanged since A1; A2 didn't write it,
+            neither did anything else in Update_Base's tree)
+```
+
+### Branch activation per invocation
+
+**Invocation A1** (state 0xa0, AUTO_DAC_PRO_FLAG=1, FW9366_LAST_AUTO=0xaa) -- the ONLY invocation that does real work:
+1. `idle_enter()` -- CONFIRMED, already tested clean live.
+2. `if (REG9366[0x77]==0): img_mode_init(0)` -- REG9366[0x77]=0 confirmed (init_flag), so this call happens here,
+   with `fw9366_context[0xfc]` STILL 0xa0 at this point (fdt_mode_init's own write to 0xfc happens LATER in its
+   body, after this call) -- relevant for tracing img_mode_init's own internal state check in Step 3.
+3. `sram_write(0x1801, 0xfc9b)` -- CONFIRMED, already tested clean live.
+4. **NEWLY FOUND, not previously traced**: a gated `0x180c` write:
+   - Check: `FW9366_LAST_AUTO(0xaa) == AUTO_DAC_PRO_FLAG(1)`? NO -> do not skip.
+   - Check: `AUTO_DAC_PRO_FLAG(1) == 0`? NO -> takes the "else" branch (not the branch I originally,
+     incorrectly assumed while first passing through this code):
+     `sram_write(0x180c, sram_bits_set(0, hi=0xa, lo=0, new=0))` = `sram_write(0x180c, 0x0000)`
+   - After either branch: `FW9366_LAST_AUTO = AUTO_DAC_PRO_FLAG` (becomes 1).
+   - **This is exactly the kind of divergence flagged as highest-risk in Step 1 of this session's plan** --
+     caught here BEFORE integrating/testing, not after.
+5. `sram_write(0x1881, 0x0f0c)` -- CONFIRMED already tested clean live (this part was correctly resolved
+   previously -- it's gated only by the a1/a2 state check at step 6, not by the AUTO_DAC_PRO_FLAG branch above,
+   confirmed by re-reading the control flow order precisely).
+6. At end of this section: `fw9366_context[0xfc] = 0xa1` (unconditional, since `fw9366_context[0xf8]` is
+   permanently 0 -- confirmed via exhaustive search).
+7. (Rest of fdt_mode_init's body beyond this point -- not yet traced, see Step 2.)
+
+**Invocation A2** (state 0xa1): Reads `fw9366_context[0xfc]==0xa1` -> matches the "state==0xa1" branch ->
+checks `fw9366_context[0xf8]==6` (permanently false) -> takes the LOG-AND-EARLY-EXIT path (jumps to near the
+end of the function, ~offset 0x229a of 0x22a6) -> **this invocation is a no-op**. It does NOT call
+`img_mode_init`, does NOT touch any SRAM registers. Only a diagnostic log line executes.
+
+**Invocation B** (state 0xa1, unchanged since A1): Same as A2 -- **also a no-op**.
+
+### Practical implication for integration (corrects prior session's test)
+
+The PREVIOUS test in `tools/rts5811_wake_test.c` exercised `idle_enter()` + the `0x1801`/`0x1881` writes as if
+they represented "the" fdt_mode_init path in general -- that conclusion was directionally right (this IS the
+one meaningful invocation) but incomplete: it MISSED the `0x180c` write entirely, and had it been traced
+further without this state-mapping step, a later linear pass could easily have picked the WRONG branch for
+`0x180c` (the code superficially reads as if `AUTO_DAC_PRO_FLAG==0` is the "normal" path, but at the real
+invocation point it is NOT 0 -- it's 1, set moments earlier by the very function that leads here). This is
+now corrected before further integration, per session ground rules.
+
+Since invocations A2 and B are both confirmed no-ops for `fdt_mode_init` specifically, **no further state
+mapping is needed for those two call paths** -- they contribute nothing beyond a log line. All further tracing
+of `fdt_mode_init`'s body should proceed from invocation A1's state only.
