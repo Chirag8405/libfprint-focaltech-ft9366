@@ -366,6 +366,58 @@ static void fdt_base_min_updata(unsigned char *swapped_buf, unsigned short *crc1
     *crc2_out = calculate_crc(crc_input, 8);
 }
 
+/* Img_Get_Avg_Middle(image_buf), traced at 0x15d574: pure local, no I/O.
+ * Median-via-histogram over a sub-region (rows 1-78, cols 2-61, stride=64)
+ * of the captured image, pixel values scaled by 1/(1<<Fw9366_cfg[0xa]).
+ * Fw9366_cfg[0xa]=2 confirmed via cfg_init -> divisor=4.
+ *
+ * IMPORTANT independent confirmation: this function's stride=64 matches
+ * this session's earlier VISUALLY-derived image width exactly -- the real
+ * firmware's own statistics code uses the same row width, not a
+ * coincidental reshape guess.
+ *
+ * BYTE ORDER CAUGHT AND CORRECTED: the literal disassembly shows a native
+ * (x86 little-endian) `movzx eax, WORD PTR [addr]` read directly on the
+ * raw captured buffer, with no visible byte-swap step anywhere in
+ * image_read/fifo_read/img_data_get (unlike the small frame_data path,
+ * which explicitly swaps). Taking that literally and reading the real
+ * captured data as little-endian produces NONSENSE (median pegged at the
+ * max bucket 1023, average ~31000 -- consistent with near-random data).
+ * Reading the SAME real data as big-endian produces physically plausible
+ * values (baseline median=665, touch median=489) consistent with the
+ * already-confirmed systematic brightness decrease under touch, and
+ * matches the byte order already used for the visually-confirmed ridge
+ * image. VALIDATED against real captured data (research/captures/ raw files)
+ * before trusting either interpretation -- the literal disassembly read
+ * turned out to be misleading (there is very likely a byte-swap step
+ * somewhere in the real chain not yet located), so this implementation
+ * uses the empirically-correct big-endian interpretation. */
+static int img_get_avg_middle(const unsigned char *image_be_pairs, int image_len_bytes)
+{
+    int divisor = 1 << 2; /* Fw9366_cfg[0xa]=2 confirmed */
+    int width = 64;
+    int histogram[1024] = {0};
+    int total = 0;
+    int npixels = image_len_bytes / 2;
+    for (int row = 1; row <= 78; row++) {
+        for (int col = 2; col <= 61; col++) {
+            int idx = row * width + col;
+            if (idx >= npixels) continue;
+            unsigned short pixel = (unsigned short)((image_be_pairs[idx * 2] << 8) | image_be_pairs[idx * 2 + 1]);
+            int bucket = pixel / divisor;
+            if (bucket > 0x3ff) bucket = 0x3ff;
+            histogram[bucket]++;
+            total++;
+        }
+    }
+    int sum = 0;
+    for (int bucket = 0; bucket < 1024; bucket++) {
+        sum += histogram[bucket];
+        if (sum > total / 2) return bucket;
+    }
+    return 1023;
+}
+
 /* FW9366_WorkMode_Cmd table, extracted directly from .rodata at 0x1c88c0
  * (3 bytes per mode, modes 0-11). Mode 11 sends only 1 byte; all others
  * send all 3. */
@@ -1010,6 +1062,11 @@ int main(void)
     } else {
         printf("== FAILED to save capture to %s ==\n", out_path);
     }
+
+    /* Img_Get_Avg_Middle() -- pure local, tested here against the real
+     * capture just taken. */
+    int avg_middle = img_get_avg_middle(image_buf, (int)sizeof(image_buf));
+    printf("== Img_Get_Avg_Middle() = %d ==\n", avg_middle);
 
     libusb_release_interface(h, 0);
     libusb_close(h);

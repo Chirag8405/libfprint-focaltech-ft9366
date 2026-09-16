@@ -1310,3 +1310,54 @@ matches, different finger/no finger reliably doesn't) as an initial milestone, w
 later. Proceeding to Steps 2-4 (calibration feedback, poa_send_para, frame data functions) first, since they
 are still required regardless of the matching approach chosen, then returning to Step 5 with this scope
 understood.
+
+## Update: Img_Get_Avg_Middle traced, tested, and a real byte-order catch (2026-09-16)
+
+Status: CONFIRMED (static disassembly + validated against real captured data + live hardware retest)
+
+### fw9366_AutoSDacUpdate (img variant) call-site check
+Only 1 caller, inside `fw9366_img_base_Update` -- confirmed part of our chain (matches the already-traced
+call list). Calls `img_data_get` (already traced) twice, plus two new functions: `Img_Get_Avg_Middle` and
+`fw9366_Img_Get_Better_DAC` (not yet traced, next).
+
+### Img_Get_Avg_Middle(image_buf) -- median-via-histogram, pure local
+
+```
+divisor = 1 << Fw9366_cfg[0xa] = 4   (Fw9366_cfg[0xa]=2 confirmed via cfg_init)
+histogram[0..1023] = 0
+for row in 1..78:
+  for col in 2..61:
+    pixel = image_buf[row*64 + col]
+    bucket = min(pixel / divisor, 1023)
+    histogram[bucket]++; total++
+return the bucket where the cumulative histogram sum first exceeds total/2 (the median)
+```
+
+**Independent confirmation of image width**: this function's row stride (64) exactly matches this session's
+earlier VISUALLY-derived image width from the ridge-pattern reconstruction -- the real firmware's own
+statistics code uses the same row width, not a coincidental reshape guess.
+
+### Real byte-order bug caught and corrected via empirical validation, not literal disassembly reading
+
+The literal disassembly shows a native (x86 little-endian) `movzx eax, WORD PTR [addr]` read directly on the
+captured buffer, with no visible byte-swap step anywhere in `image_read`/`fifo_read`/`img_data_get` (unlike
+the small frame_data path, which explicitly swaps). Taking this literally and computing the median with
+little-endian interpretation on the real captured data produces **nonsense**: median pegged at the maximum
+bucket (1023) for both baseline and touch, average ~31000 (consistent with near-random/noise data). The exact
+same real data interpreted as **big-endian** produces physically plausible results matching everything already
+confirmed: baseline median=665, touch median=489 (lower under touch, consistent with the already-confirmed
+systematic brightness decrease).
+
+**This implementation uses the empirically-validated big-endian interpretation**, not the literal disassembly
+reading -- there is very likely a byte-swap step in the real chain not yet located (possibly inside
+`ff_spi_read_image_buf` itself, not yet traced at the instruction level for its buffer handling, or elsewhere).
+Flagging this as resolved-by-evidence rather than resolved-by-disassembly, and noting the discrepancy plainly
+per this session's "never round an ambiguous result up" discipline -- the *behavior* is confirmed correct via
+real data, the exact mechanism producing it in the original binary is not yet located.
+
+### Live hardware retest
+`Img_Get_Avg_Middle()` on a fresh no-finger capture returned 664, consistent with the earlier baseline (665).
+
+### Next concrete action
+Trace `fw9366_Img_Get_Better_DAC` (1700 bytes) -- takes the avg_middle value (or the image itself) and
+computes an updated DAC setting; this is the actual feedback/convergence logic Step 2 is asking about.
