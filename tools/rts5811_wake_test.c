@@ -73,6 +73,47 @@ static int otp_read(libusb_device_handle *h, unsigned char addr, unsigned char *
     return 0;
 }
 
+/* 16-bit SRAM address space, distinct from the 8-bit SFR space above.
+ * Address encoding (identical in both sram_write and sram_read, traced at
+ * 0x1660e3 / 0x1663d0): enc_hi = ((addr>>8)&0x7f)|0x80, enc_lo = addr&0xff.
+ * The "00 01" mid-field is a length-derived constant that happens to be
+ * fixed for this function's always-2-byte address encoding. */
+static void sram_encode_addr(unsigned short addr, unsigned char *hi, unsigned char *lo)
+{
+    *hi = (unsigned char)(((addr >> 8) & 0x7f) | 0x80);
+    *lo = (unsigned char)(addr & 0xff);
+}
+
+/* fw9366_sram_write(addr, value), traced at 0x1660e3: write-only, opcode
+ * [0x05, 0xfa]. */
+static int sram_write(libusb_device_handle *h, unsigned short addr, unsigned short value)
+{
+    unsigned char hi, lo;
+    sram_encode_addr(addr, &hi, &lo);
+    unsigned char buf[8] = { 0x05, 0xfa, hi, lo, 0x00, 0x01,
+                              (unsigned char)((value >> 8) & 0xff), (unsigned char)(value & 0xff) };
+    return bulk_write(h, buf, sizeof(buf));
+}
+
+/* fw9366_sram_read(addr), traced at 0x1663d0: opcode [0x04, 0xfb], write 6
+ * bytes, read 6 bytes, result = (resp[0]<<8)|resp[1]. This is the SAME sram
+ * address space and read primitive used by fw9366_chipid_get() (addr
+ * 0x1a8b) per the very first session's notes -- the original "chipid reads
+ * 0x0" question this whole project started on. */
+static int sram_read(libusb_device_handle *h, unsigned short addr, unsigned short *out)
+{
+    unsigned char hi, lo;
+    sram_encode_addr(addr, &hi, &lo);
+    unsigned char cmd[6] = { 0x04, 0xfb, hi, lo, 0x00, 0x01 };
+    unsigned char resp[6] = { 0 };
+    printf(" sram_read(0x%04x):\n", addr);
+    int wr = bulk_write(h, cmd, sizeof(cmd));
+    int rr = bulk_read(h, resp, sizeof(resp));
+    if (wr != 0 || rr != 0) return -1;
+    *out = (unsigned short)((resp[0] << 8) | resp[1]);
+    return 0;
+}
+
 int main(void)
 {
     libusb_context *ctx = NULL;
@@ -236,6 +277,37 @@ int main(void)
                otp3 & 0x1f, otp13 & 0x0f);
     } else {
         printf("\n== otp_read failed (transfer error) ==\n");
+    }
+
+    /* fw9366_init_flag() (0x154cc2): pure local REG9366/fw9366_context state,
+     * zero USB traffic -- not tested against hardware for the same reason
+     * cfg_init wasn't: there is nothing to send. */
+    printf("\n== fw9366_init_flag(): local state only, no hardware transfer (not tested) ==\n");
+
+    /* fw9366_intflag_clear(0xffff) -> sram_write(0x1a84, 0xffff), traced at
+     * 0x1549b3. Fire-and-forget, no response to check. */
+    printf("\n== fw9366_intflag_clear(0xffff) -> sram_write(0x1a84, 0xffff) ==\n");
+    sram_write(h, 0x1a84, 0xffff);
+
+    /* Opportunistic bonus test, not strictly part of the traced init chain
+     * order but cheap and directly relevant: fw9366_chipid_get() (from the
+     * very first session's notes) is sram_read(0x1a8b). This is the exact
+     * question this whole project started on -- report the raw result
+     * without rounding up an ambiguous value into "it worked". */
+    printf("\n== BONUS: fw9366_chipid_get() equivalent -> sram_read(0x1a8b) ==\n");
+    unsigned short chipid = 0;
+    int cr = sram_read(h, 0x1a8b, &chipid);
+    if (cr == 0) {
+        printf("\n== chipid raw result: 0x%04x ==\n", chipid);
+        if (chipid == 0x9366) {
+            printf("== MATCHES expected FT9366 chip ID exactly. ==\n");
+        } else if (chipid == 0x0000) {
+            printf("== Still reads as 0x0000 -- same failure mode as the original question, not resolved by this sequence alone. ==\n");
+        } else {
+            printf("== Non-zero but does NOT match 0x9366 -- new data point, not yet interpreted. Do not assume success. ==\n");
+        }
+    } else {
+        printf("\n== chipid sram_read transfer failed/timed out ==\n");
     }
 
     libusb_release_interface(h, 0);

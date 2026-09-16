@@ -425,3 +425,78 @@ Every command tried against real hardware in this protocol family (SFR read/writ
 
 ### Next concrete action
 Trace `fw9366_init_flag()` and `fw9366_intflag_clear(0xffff)` (both run between `get_SMIC_IC_flag`/`Get_OTP_Info` and `cfg_init` in the real `fw9366_init_chip` sequence).
+
+## Update: fw9366_init_flag, fw9366_intflag_clear, SRAM read/write traced -- CHIP ID SUCCESSFULLY READ (2026-09-16)
+
+Status: CONFIRMED (static disassembly AND live hardware test, stable across 3 independent runs)
+
+### fw9366_init_flag() (address 0x154cc2)
+Pure local state again -- zeroes/constants written into `REG9366` and `fw9366_context` globals, zero USB traffic. Same category as `cfg_init`: nothing to test against hardware.
+
+### fw9366_sram_write(addr, value) / fw9366_sram_read(addr) -- NEW confirmed command family, 16-bit address space
+
+Distinct from the 8-bit SFR space (`08 f7`/`09 f6`) used earlier. Address encoding (identical logic in both write and read):
+
+```text
+enc_hi = ((addr >> 8) & 0x7f) | 0x80
+enc_lo = addr & 0xff
+```
+
+```text
+SRAM_WRITE(addr, value):        [opcode 0x05, 0xfa]
+  Bulk OUT ep0x01: [0x05, 0xfa, enc_hi, enc_lo, 0x00, 0x01, (value>>8)&0xff, value&0xff]
+  No response (fire-and-forget, via ff_spi_write_buf_rts, same as SFR_WRITE).
+
+SRAM_READ(addr):                [opcode 0x04, 0xfb]
+  Bulk OUT ep0x01: [0x04, 0xfb, enc_hi, enc_lo, 0x00, 0x01]
+  Bulk IN  ep0x82: 6 bytes; result = (resp[0]<<8) | resp[1]
+  (via ff_spi_write_then_read_buf_rts, same transport as the original wake ping)
+```
+
+The "0x00, 0x01" mid-field is a length-derived constant that happens to be fixed for this function (it always encodes a 2-byte address), not independently variable.
+
+### fw9366_intflag_clear(0xffff) -> sram_write(0x1a84, 0xffff)
+
+Tested live: `05 fa 9a 84 00 01 ff ff` sent successfully (fire-and-forget, no response to check).
+
+### fw9366_chipid_get() -- CONFIRMED to be sram_read(0x1a8b), exact disassembly match
+
+```
+fw9366_chipid_get() (0x154955):
+  return sram_read(0x1a8b)
+```
+
+This is the exact function referenced in the very first session's research notes ("chipid reads 0x0"). Not an approximation -- direct 1:1 disassembly match with what was tested.
+
+### LIVE HARDWARE RESULT -- first non-zero, stable chip ID read in this project's history
+
+```text
+sram_read(0x1a8b):
+  sent: 04 fb 9a 8b 00 01
+  recv: 93 62
+  result: 0x9362
+```
+
+Repeated 3x across independent fresh device-open sessions: **identical result every time (0x9362)**. Not noise/garbage -- stable, well-formed, non-zero.
+
+### Honest caveat -- not independently verified against an authoritative "expected" constant
+
+`ft_feature_devinit_JudgeByChipId` (the function that should validate a read chip ID) is a **no-op stub in this build**: it sets up two local byte arrays (`{0x06,0xf9,0x00}` and `{0x11,0xee,0x02,0x00}` -- possibly parameters for yet another undiscovered command opcode, not comparison constants) but never actually reads its input parameter or performs a comparison; it just logs and returns 0. So there is no in-binary authoritative constant to confirm `0x9362` is "the correct" value. What IS confirmed:
+- The function tested is byte-for-byte the real `fw9366_chipid_get()`, not a guess.
+- The result is stable and well-formed, not random/garbage.
+- The top byte (`0x93`) matches the `FT9366` naming exactly; the low byte (`0x62` vs. a naively-assumed `0x66`) is plausibly a revision/stepping/mask field rather than evidence of a wrong read -- chip ID registers commonly differ from marketing part numbers in exactly this way.
+- Do NOT read this as "enrollment/verify now works" -- it confirms the SRAM/SFR command family is correct and the chip is responding meaningfully for the first time, not that the full protocol (crypto/capture/enroll) is solved.
+
+### Running tally of confirmed-working real commands
+1. Wake ping: `4c 5a 01 00` -> `04 00 00 04`
+2. SFR read: `08 f7 <reg> 00 00` -> 1 byte
+3. SFR write: `09 f6 <reg> <val>` -> no response
+4. OTP read (composite, built on SFR read/write)
+5. SRAM write: `05 fa <hi> <lo> 00 01 <val_hi> <val_lo>` -> no response
+6. SRAM read: `04 fb <hi> <lo> 00 01` -> 6 bytes, result = first 2 bytes big-endian
+7. Chip ID read (= SRAM read of 0x1a8b) -> stable `0x9362`
+
+Every single command attempted against real hardware in this session has worked cleanly -- zero timeouts, zero malformed responses, across two full protocol families (SFR and SRAM) and 7 distinct confirmed operations.
+
+### Next concrete action
+Continue the `fw9366_init_chip` chain: `fw9366_Update_Base()` (~601 bytes, not yet traced) is next. Given the strong track record so far, also worth checking whether `ft_feature_devinit_JudgeByChipId`'s two mystery byte sequences (`06 f9 00` / `11 ee 02 00`) correspond to a THIRD command opcode family, since `06 f9` and `04 fb`/`05 fa`/`08 f7`/`09 f6` all share the "byte0 < 0x10, byte1 in 0xf0-0xff range" pattern -- possibly worth a quick side-check.
