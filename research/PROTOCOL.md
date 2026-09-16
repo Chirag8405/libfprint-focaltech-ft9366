@@ -3376,3 +3376,87 @@ underlying descriptor+scoring signal DOES exist and IS discriminative when align
 alignment-estimation robustness (specifically to rotation) that is missing. Next step: disassemble
 `FtRansacAngle_32f` (file offset 0xf67b0) specifically, prioritized over `FtRansacEdage_32f`, since the
 symptom isolates cleanly to rotation/angle handling rather than general point-correspondence consensus.
+
+## FtRansacAngle_32f disassembled: real algorithm is pairwise-distance-consistency voting, not random-sample RANSAC (2026-09-16)
+
+Status: CONFIRMED for the two core mathematical pieces (exact formulas, raw disassembly, not decompiler
+guesswork). The outer seed-selection/iteration control flow is understood at an architectural level (not
+byte-exact -- the remaining ~700 lines are dominated by error-logging boilerplate consistent with this
+project's pattern elsewhere, plus refinement-loop bookkeeping not traced to the last instruction). This is a
+deliberate pragmatic stopping point, matching this project's established practice of nailing the CRITICAL
+formulas exactly and treating remaining structural glue as best-effort + empirical validation.
+
+### Core finding: correspondence filtering uses rotation/translation-INVARIANT pairwise distances, not spatial proximity
+Disassembled the main double loop (offsets 0xf6963-0xf6a51). For every pair of candidate correspondences (i,j),
+it computes `distA = |A[i]-A[j]|` (distance between the two points in template A) and `distB = |B[i]-B[j]|`
+(same two candidates' points in template B), and marks the pair "compatible" (sets a symmetric adjacency
+matrix entry) iff **`|distA - distB| < 2.0` pixels** (exact constants extracted from `.rodata`: 2.0 @0x1a3eec
+for the distA>=distB branch, -2.0 @0x1a980c for the distA<distB branch -- algebraically the same symmetric
+threshold, just branched on sign rather than computed via `fabsf`).
+
+This is qualitatively different from this reimplementation's `ransac_affine`, which tests spatial proximity of
+a candidate's point to a MINIMAL-SAMPLE-ESTIMATED affine's prediction (data-dependent on which random 3 points
+got picked). Pairwise point-to-point DISTANCE within one template's own coordinate frame is invariant to
+rotation and translation of the OTHER template entirely -- so this filtering step works identically well
+regardless of how much the two captures are rotated relative to each other, which directly explains the
+synthetic-diagnostic finding that rotation breaks this reimplementation's matcher but not (per the real
+algorithm's design) the real one.
+
+After building the adjacency matrix, the code computes a per-candidate degree (row-sum of the adjacency matrix,
+i.e. how many OTHER candidates each one is pairwise-consistent with -- offsets 0xf6cc9-0xf6d4d) and picks the
+candidate with the MAXIMUM degree as a seed, tracked via `ebx`/`r9d` in the disassembly. This is a well-known
+robust-matching technique (sometimes called geometric-consistency clustering / compatibility voting), distinct
+from and more stable than random minimal-sample RANSAC when the candidate pool is small (as it is here, ~15-30
+candidates) since it uses ALL pairwise structure rather than gambling on a lucky random triple.
+
+### Core finding: exact closed-form rotation+translation estimator, `FtEstimateRotParms_32f` (offset 0xf3f60)
+Fully traced. Given two point arrays A, B (stride 16 bytes, only x,y used) and an index list selecting which
+correspondences to use:
+```
+sumDot   = Sum_i [Ai.x*Bi.x + Ai.y*Bi.y]                (per-i "self" dot term)
+sumCross = Sum_i [Bi.x*Ai.y - Ai.x*Bi.y]                 (per-i "self" cross term)
+sumSumDot   = -Sum_i Sum_j [Bi.x*Aj.x + Bi.y*Aj.y]        (full n x n double sum, negated)
+sumSumCross =  Sum_i Sum_j [Ai.x*Bj.y - Ai.y*Bj.x]         (full n x n double sum)
+numerator   = n*sumDot   + sumSumDot
+denominator = n*sumCross + sumSumCross
+theta = FtArctan(numerator, denominator)     -- confirmed to be atan2f(denominator, numerator) by argument
+                                                 order at the call site (numerator=dot-like="cos" component in
+                                                 xmm0, denominator=cross-like="sin" component in xmm1)
+(c, s) = (cosf(theta), sinf(theta))
+dx = mean_i [Ai.x - (Bi.x*c - Bi.y*s)]     (average translation needed after rotating B by theta)
+dy = mean_i [Ai.y - (Bi.x*s + Bi.y*c)]
+```
+This O(n^2) double-sum formula is algebraically EQUIVALENT to the textbook centroid-relative 2D Procrustes
+rotation estimate `theta = atan2(Sum cross(Ai-meanA, Bi-meanB), Sum dot(Ai-meanA, Bi-meanB))` -- since
+`Sum_i Sum_j dot(Bi,Aj) = dot(SumB, SumA) = n^2 * meanA.meanB` by separability of the double sum, so
+`n*sumDot - dot(SumA,SumB) = n * Sum_i dot(Ai-meanA, Bi-meanB)` exactly (same for cross). `FtArctan` itself is a
+custom fixed-point-lookup-table `atan2f` approximation (confirmed structurally: branches on sign of both
+inputs, then compares magnitudes, classic atan2-via-atan(min/max)-plus-quadrant-fixup); using the real `atan2f`
+from libm in the reimplementation is a safe, MORE accurate substitution, not an approximation of an
+approximation.
+
+`FtGetAngle_32f` (offset 0xf5580, fully traced) is a separate, simpler utility: given three points P0,P1,P2,
+returns the angle at vertex P1 between rays P1->P0 and P1->P2, in degrees, range [0,180] (via
+`acosf(dot(A,B)/(|A||B|))` with the standard degenerate-input guards). It is called twice inside
+`FtRansacAngle_32f` but this reimplementation did not trace precisely where in the still-unexplored ~700 lines
+those calls are used (a plausible role: checking that a candidate triple isn't near-degenerate/collinear before
+trusting it as a seed, a standard RANSAC minimal-sample sanity check -- not confirmed).
+
+### Not traced to completion (explicit scope decision)
+The exact seed/tie-breaking rule beyond "maximum degree", the refinement-iteration loop structure (why
+`FtEstimateRotParms_32f` is called twice -- most plausibly once on the graph-selected consensus set, once
+after a residual-based outlier prune, mirroring standard RANSAC-then-refit), and the handoff into
+`FtRansacEdage_32f` are NOT traced byte-exact. This mirrors the FtCalcSimScore-tracing precedent: the two
+CRITICAL formulas (distance-consistency threshold, closed-form rotation estimator) are exact; the surrounding
+control flow is treated as best-effort, to be validated empirically by whether replicating just these two
+pieces measurably closes the rotation-robustness gap found by the synthetic diagnostic.
+
+### Plan: reimplement using distance-consistency graph + closed-form rotation/translation fit (rigid, not affine)
+Replace `focal_verify.c`'s `find_candidates`+`ransac_affine` (spatial-proximity RANSAC over a random-sample
+affine) with: (1) build the same pairwise distance-consistency adjacency matrix (<2px) among descriptor
+candidates, (2) seed from the maximum-degree candidate's compatible set, (3) fit rotation+translation via the
+confirmed closed-form estimator (a RIGID transform -- rotation+translation only, no independent scale/shear,
+matching what `FtEstimateRotParms_32f` computes), (4) one refinement pass (recompute residuals against the fit,
+drop outliers, refit), (5) feed the result into the existing, already-confirmed `FtCalcSimScore` scoring. Will
+validate against `test_rotation_sweep`/`test_synthetic` first (should flatten the rotation-degradation curve
+close to 1.0), then the real same/different-finger dataset.
