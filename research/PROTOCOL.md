@@ -1160,3 +1160,54 @@ transfer -> scan end) works correctly at the wire level and pulls real, structur
 does NOT yet confirm this specific capture is a fingerprint pattern versus a no-finger baseline/dark
 reference -- that requires a live touch comparison, not yet done. Next action: repeat this exact capture
 while physically touching the sensor and compare.
+
+## MAJOR MILESTONE: touch-responsive signal confirmed in real image capture (2026-09-16)
+
+Status: CONFIRMED via live comparison (properly synchronized: user confirmed finger already on sensor before
+capture was triggered)
+
+### Comparison: no-finger baseline vs. confirmed-touch capture
+
+Both captures used the identical `img_data_get(param=0)` path (full 10240-byte image, `fifo_read(0x1a05,...)`).
+
+```
+Baseline (no finger):  00 00 08 7f 08 6d 08 67 08 8f 07 f8 08 bc 08 7b 09 0b 09 de 09 6a 0a 61 ...
+                        nonzero=9900/10240, avg=66.4
+
+Touch (confirmed):      00 00 06 1f 05 a7 05 96 05 d9 05 98 06 d2 06 ce 07 4e 07 bf 06 d5 07 73 ...
+                        nonzero=9892/10240, avg=65.1
+```
+
+Per-sample comparison (interpreting each 2-byte pair as big-endian u16):
+
+| offset | baseline | touch | diff |
+|---|---|---|---|
+| 2-3 | 0x087f (2175) | 0x061f (1567) | -608 |
+| 4-5 | 0x086d (2157) | 0x05a7 (1447) | -710 |
+| 6-7 | 0x0867 (2151) | 0x0596 (1430) | -721 |
+| 8-9 | 0x088f (2191) | 0x05d9 (1497) | -694 |
+| 10-11 | 0x07f8 (2040) | 0x0598 (1432) | -608 |
+| 12-13 | 0x08bc (2236) | 0x06d2 (1746) | -490 |
+
+**A consistent, systematic downward shift of ~400-700 units across every sample point in the same direction.**
+This is categorically different from an earlier (improperly-synchronized, no actual finger present) run-to-run
+comparison, which showed only single-digit differences (noise-level). This coherent, structured shift is
+exactly the kind of signature expected from a real physical touch changing the sensor's electrical/optical
+readout baseline.
+
+### Honest interpretation
+
+CONFIRMED: the sensor's raw output changes in a consistent, structured, non-random way when a finger is
+physically present, using the fully-traced capture pipeline (`img_scan_start` -> `image_read`/`fifo_read` ->
+`img_scan_end`). This is strong evidence of genuine touch sensitivity, not noise.
+
+NOT yet confirmed: whether this raw byte stream, once correctly reshaped/decoded (pixel layout, orientation,
+bit-depth interpretation), forms a recognizable/viewable fingerprint ridge pattern. That requires further work
+(likely image reconstruction/visualization, not yet attempted) and is the natural next validation step.
+
+### Coordination note (process, not technical)
+An earlier attempted touch-comparison in this session was invalid: it compared two no-finger baseline
+captures against each other (the finger was not actually present during either capture due to a
+synchronization mix-up) and showed only noise-level differences, as expected for two baseline reads. Corrected
+by explicitly confirming finger placement before triggering, same as prior live hardware coordination in this
+session.
