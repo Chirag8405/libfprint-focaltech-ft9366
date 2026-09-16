@@ -125,6 +125,32 @@ static int sram_read(libusb_device_handle *h, unsigned short addr, unsigned shor
     return 0;
 }
 
+/* fw9366_sram_read_bulk_withecc(addr, out_buf, len_words), traced at
+ * 0x1666cb: same address encoding as sram_read/write, but a dynamic
+ * length field (same divide-by-2 encoding already validated for the fixed
+ * len=2 case elsewhere) and a variable-length bulk read straight into the
+ * caller's buffer. IMPORTANT: the actual bytes read back is (len_words-2),
+ * not len_words -- confirmed from the disassembly's internal length
+ * variable, not assumed. */
+static int sram_read_bulk_withecc(libusb_device_handle *h, unsigned short addr,
+                                    unsigned char *out_buf, unsigned short len_words)
+{
+    unsigned char hi, lo;
+    sram_encode_addr(addr, &hi, &lo);
+    unsigned short internal_len = (unsigned short)(len_words - 2);
+    /* Same "divide by 2, sign-corrected" length encoding already validated
+     * via the fixed len=2 case elsewhere (which produced bytes 00 01,
+     * i.e. half=1 stored as the high byte of the mid-field with the low
+     * byte always 0x00). Here half is dynamic. */
+    unsigned char half = (unsigned char)(internal_len / 2);
+    unsigned char cmd[6] = { 0x04, 0xfb, hi, lo, 0x00, half };
+    printf(" sram_read_bulk_withecc(0x%04x, len_words=%u -> actual %u bytes):\n", addr, len_words, internal_len);
+    int wr = bulk_write(h, cmd, sizeof(cmd));
+    int rr = bulk_read(h, out_buf, internal_len);
+    if (wr != 0 || rr != 0) return -1;
+    return 0;
+}
+
 /* fw9366_sfr_read(reg), traced at 0x165f86 (used earlier inline for the
  * smic_flag loop; factored out here as a reusable helper now that more
  * callers need it). */
@@ -177,6 +203,31 @@ static int wdtcnt_gap_set(libusb_device_handle *h, unsigned short val)
     sfr_write(h, 0x91, (unsigned char)((val >> 8) & 0xff));
     sfr_write(h, 0x92, (unsigned char)(val & 0xff));
     wdtcnt_int_en(h, 1);
+    return 0;
+}
+
+/* fw9366_fdt_block(), traced at 0x155c3d: pure local, returns 4 since
+ * Fw9366_cfg[2]==1 (confirmed always true), no I/O. */
+static int fdt_block(void) { return 4; }
+
+/* fw9366_fdt_get_a_frame_data(out_buf), traced at 0x155c5e. Calls
+ * fdt_block() (=4, local), branches on smic_flag (confirmed =0 for this
+ * unit, live-measured earlier -- NOT 0xaa, so our path uses address 0xb8),
+ * bulk-reads via sram_read_bulk_withecc, then byte-swaps each of the
+ * `block` 16-bit words in place. out_buf must be at least 2*block bytes
+ * (8 bytes for block=4). */
+static int fdt_get_a_frame_data(libusb_device_handle *h, unsigned char *out_buf)
+{
+    int block = fdt_block();
+    unsigned short len_words = (unsigned short)((block + 1) * 2);
+    unsigned short addr = 0xb8; /* smic_flag=0 != 0xaa confirmed -> this branch */
+    sram_read_bulk_withecc(h, addr, out_buf, len_words);
+    for (int i = 0; i < block; i++) {
+        unsigned char b0 = out_buf[i * 2];
+        unsigned char b1 = out_buf[i * 2 + 1];
+        out_buf[i * 2] = b1;
+        out_buf[i * 2 + 1] = b0;
+    }
     return 0;
 }
 
@@ -718,6 +769,16 @@ int main(void)
     intflag_mask(h, 3);
     printf("-- [fdt_mode_init: REG9366[0x78]=1 -- host-side only, no wire effect] --\n");
     printf("\n== fdt_mode_init COMPLETE -- fully traced, 100%% ==\n");
+
+    /* --- fw9366_fdt_get_a_frame_data() -- fully traced (200 bytes), tested
+     * here. Called next in fdt_base_Stable_Update's real sequence, after
+     * fdt_manual_start returns. Uses a NEW primitive,
+     * sram_read_bulk_withecc, the first variable-length bulk read this
+     * session (vs. single-register reads so far). */
+    printf("\n== fw9366_fdt_get_a_frame_data() -- fully traced, 100%% ==\n");
+    unsigned char frame_buf[8] = { 0 };
+    fdt_get_a_frame_data(h, frame_buf);
+    hexdump("  frame_buf after byte-swap", frame_buf, sizeof(frame_buf));
 
     libusb_release_interface(h, 0);
     libusb_close(h);

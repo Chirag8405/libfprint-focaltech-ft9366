@@ -944,3 +944,54 @@ calls to `fdt_manual_start`/`fdt_get_a_frame_data`, not yet traced) -- OR procee
 `fw9366_fdt_get_a_frame_data` (called next in `fdt_base_Stable_Update`'s sequence after `fdt_manual_start`
 returns) per the original call order. `fdt_get_a_frame_data` is the next untraced function in the direct
 outer sequence.
+
+## Update: fw9366_fdt_get_a_frame_data traced and tested -- new bulk-read primitive (2026-09-16)
+
+Status: CONFIRMED (transfer mechanics, static disassembly + live test); DATA CONTENT not yet interpreted
+
+### Call-site check
+4 call sites total. Two (`fw9366_fdt_manual_check`, `fw9366_fdt_manual_store`) are NOT reachable from anything
+traced in this session's confirmed chain -- noted, not chased. The two relevant ones are inside
+`fw9366_fdt_AutoSDacUpdate` (internal call) and `fw9366_fdt_base_Stable_Update` (direct call, after
+`fdt_manual_start` returns) -- same dual-invocation shape already seen for `fdt_mode_init`, but this function
+itself has no `fw9366_context[0xfc]`-style state guard, so (unlike `fdt_mode_init`) both invocations likely do
+real work -- not yet separately verified for the second call site.
+
+### fw9366_sram_read_bulk_withecc(addr, out_buf, len_words) -- NEW primitive, first variable-length bulk read
+
+```text
+Bulk OUT ep0x01: [0x04, 0xfb, enc_hi, enc_lo, 0x00, half]   (6 bytes)
+  where half = (len_words - 2) / 2   -- same divide-by-2 encoding already validated via the
+  fixed len=2 case used by plain sram_read/sram_write (which produces "00 01" for half=1)
+Bulk IN  ep0x82: (len_words - 2) bytes, directly into caller's buffer
+  -- CONFIRMED the actual byte count read is len_words-2, not len_words, from the disassembly's
+     internal length variable, not assumed
+```
+
+### fw9366_fdt_get_a_frame_data(out_buf)
+
+```
+block = fdt_block() = 4   (confirmed always, Fw9366_cfg[2]=1)
+len_words = (block+1)*2 = 10
+addr = (smic_flag==0xaa) ? 0xe8 : 0xb8   -- smic_flag=0 confirmed (this unit) -> addr=0xb8
+sram_read_bulk_withecc(addr, out_buf, len_words)   -- reads 8 actual bytes
+for i in 0..block-1: byte-swap out_buf[i*2..i*2+1] in place
+```
+
+### Live hardware test
+
+```
+sent: 04 fb 80 b8 00 04   (matches hand-derived header exactly)
+recv: 00 00 00 00 00 00 00 00   (8 bytes, as predicted from len_words-2=8)
+```
+
+Transfer mechanics CONFIRMED correct (right header bytes, right length, zero timeout). **Data content is all
+zeros** -- reporting this exactly as observed, not interpreting it as success or failure. This could be the
+expected pre-scan/calibration state (no real finger-detect cycle has been armed/triggered yet in this
+session's sequence), or could indicate frame data isn't populated at this point without a preceding trigger
+not yet identified. Not yet resolved either way -- flagged as an open question, not glossed over.
+
+### Next concrete action
+`fw9392_fdt_base_fail_check` and `fw9366_fdt_base_Min_Updata` (both called after `fdt_get_a_frame_data` in
+`fdt_base_Stable_Update`'s real sequence) -- one of these likely interprets/validates the frame data just read,
+which may clarify whether the all-zeros result is expected at this stage.
