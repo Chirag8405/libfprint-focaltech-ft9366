@@ -1361,3 +1361,48 @@ real data, the exact mechanism producing it in the original binary is not yet lo
 ### Next concrete action
 Trace `fw9366_Img_Get_Better_DAC` (1700 bytes) -- takes the avg_middle value (or the image itself) and
 computes an updated DAC setting; this is the actual feedback/convergence logic Step 2 is asking about.
+
+## Update: STEP 2 -- AutoSDacUpdate architecture confirmed, deep threshold logic deliberately deprioritized (2026-09-16)
+
+Status: CONFIRMED (architecture/call structure), NOT exhaustively traced (deliberate scope decision, explained below)
+
+### fw9366_Img_Get_Better_DAC(...) call-site and structure
+
+Called from `fw9366_AutoSDacUpdate` (img variant, single caller confirmed in our chain, inside
+`img_base_Update`). Structure: performs up to 3 real image-capture cycles (`img_data_get`, already fully
+traced and tested), evaluating each via `Img_Get_Out_Of_Range_Point` (new, un-traced helper -- counts
+saturated/out-of-range pixels, ~245 bytes) and (for 2 of the 3 cycles) `Img_Get_Avg_Middle` (already traced).
+Extensively reads/writes `REG9366` fields throughout (confirmed via disassembly) but **does not itself call
+any sram_write/sfr_write** -- no direct hardware I/O beyond the image captures needed to evaluate each trial.
+
+### Confirmed answer to Step 2's core question
+
+**What gets tuned**: a DAC candidate value held in a `REG9366` field (the same field, `REG9366[0x87]`/related,
+already confirmed consumed by `fdt_mode_init`'s and `img_mode_init`'s own SRAM writes to `0x1801` etc., both
+already fully traced). This function does not apply the DAC to hardware directly -- it updates the host-side
+candidate value, which takes effect the next time the already-traced init sequences run.
+
+**Feedback signal**: derived from real captured images -- a count of out-of-range (saturated) pixels
+(`Img_Get_Out_Of_Range_Point`) and the median pixel value (`Img_Get_Avg_Middle`, already traced and validated
+against real data).
+
+**Convergence/exit condition**: NOT exhaustively traced (see scope decision below) -- the function performs a
+bounded number of capture-evaluate-adjust cycles (up to 3 visible in the call list) rather than an open-ended
+loop.
+
+### Deliberate scope decision, stated plainly
+
+The remaining ~1700 bytes of fine-grained threshold/comparison logic (exact numeric conditions for how much
+to adjust the DAC candidate per cycle) were NOT exhaustively traced. Reasoning: this session has already
+empirically captured a real, visually-confirmed fingerprint ridge image (see the earlier milestone) using
+ONLY the already-traced default/uncalibrated `img_mode_init`/`fdt_mode_init` DAC values -- i.e. this
+calibration refinement is confirmed NOT to be a blocker for obtaining a usable capture, only a potential
+image-quality optimization. Given the much larger and genuinely blocking remaining work (Step 5: real
+host-side matching, which is currently entirely unimplemented and is the actual bar for "enroll/verify
+works"), continuing to exhaustively trace this specific refinement logic now would be lower-value than
+proceeding to the blocking work. This is a considered prioritization call, stated explicitly rather than
+silently skipped -- revisit if captured image quality turns out to be insufficient for reliable matching.
+
+### Next concrete action
+Proceed to Step 3 (`poa_send_para`) and Step 4 (frame_data resolution) as planned, then prioritize Step 5
+(real host-side matching) as the primary remaining focus.
