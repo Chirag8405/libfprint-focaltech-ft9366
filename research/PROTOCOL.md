@@ -2970,3 +2970,53 @@ pixel coordinates/interpolation/pyramid level) or in the bit-comparison stage (M
 
 Not yet done in the previous session: reproducing this exact keypoint's 45 samples in `focal_sift.c` and
 diffing value-by-value against this real array -- picking this up now.
+
+## STEP 1-2 RESULT: found a second real error (2x not 1.5x), then found the pyramid CONTENT is actually very close (2026-09-16)
+
+Status: CONFIRMED via direct real-pyramid inspection (not inference). Corrects an error from the previous
+session and substantially changes the picture.
+
+### Correction: the real SIFT-like detection pyramid uses OpenSIFT-stock 2x doubling, NOT 1.5x
+Broke inside `FtMfbDescriptors` (via `gauss_pyr` argument, live at the breakpoint) and directly inspected the
+REAL pyramid structure:
+```
+gauss_pyr[0][0]: depth=32, width=192, height=192   (192 = 96*2 -- standard OpenSIFT 2x doubling)
+gauss_pyr[1][0]: depth=32, width=96,  height=96
+gauss_pyr[2][0]: depth=32, width=48,  height=48
+gauss_pyr[3][0]: depth=32, width=24,  height=24    (4 real octaves confirmed; gauss_pyr[4] crashes -- doesn't exist)
+```
+**This directly contradicts the previous session's "confirmed" 1.5x scale finding.** That finding (`imgSizeScale
+= round(dim*3/2) = 144x144`, from `FtGetTemplate`'s locals/disassembly) was real disassembly/data, but was
+WRONGLY assumed to be the SAME thing as this SIFT pyramid's img_dbl step -- it must belong to some OTHER
+`FtGetTemplate`-internal stage (not yet identified; `FtGetTemplate` and `FtGetMfbFeatures` are different
+functions with their own separate internal image buffers, and conflating "a 1.5x resize happens somewhere in
+FtGetTemplate" with "the SIFT pyramid's own doubling step is 1.5x" was an unjustified leap). Corrected
+`focal_sift.c`'s `FOCAL_DBL_SCALE` from 1.5 back to 2.0, and increased octaves from 3 to 4 to match.
+
+### Direct raw-pixel-row comparison: pyramid CONTENT is remarkably close, not fundamentally wrong
+Dumped real `gauss_pyr[1][0]` row 86 (the octave/row containing the target keypoint) directly via gdb, and
+the equivalent row from `focal_sift.c`'s own rebuilt pyramid (same octave/interval) on the same image. Both
+show the SAME overall envelope shape (near-zero padding, rising edge, plateau with the same local wiggle
+pattern around indices 28-38, falling edge) -- e.g. both show a local dip-then-rise around column 32-34 before
+the main plateau. **This is a real, substantive positive finding: the pyramid construction is fundamentally
+correct**, not a wholesale mismatch.
+
+The remaining difference is consistent with a small SUB-PIXEL shift and/or sharper-than-real edges in my
+version (my rising edge crosses the midpoint about 1px earlier than real's; my peak values run ~15-20 units
+higher than real's plateau). Given real fingerprint ridge images have steep local gradients, even a ~1px
+misalignment produces LARGE per-sample differences at specific rotated offset points -- this plausibly explains
+why the earlier octave/interval sum-of-squared-error search (which samples at specific offset points, not
+whole-row comparison) found no clean match despite the underlying pyramid being fundamentally close.
+
+### Leading hypotheses for the remaining sub-pixel discrepancy (not yet tested)
+1. `create_init_img`'s upscale interpolation: `focal_sift.c` uses plain bilinear; OpenSIFT's stock (and
+   plausibly the real algorithm) uses bicubic (`CV_INTER_CUBIC`) for the img_dbl upscale specifically -- a
+   real, previously-noted-but-not-implemented gap (see this session's earlier "create_init_img" comments).
+2. A half-pixel/pixel-center alignment convention difference in the resize formula.
+3. The initial blur sigma (`sig_diff`) formula, though independently re-derived and mathematically consistent
+   with OpenSIFT's convention, has not been bit-verified against the real algorithm's own initial-blur amount.
+
+### Next concrete action
+Implement bicubic interpolation for the img_dbl upscale (the most likely, most standard candidate) and re-run
+this same row-level comparison to check whether it closes the remaining sub-pixel gap, before re-testing the
+single-keypoint descriptor match.
