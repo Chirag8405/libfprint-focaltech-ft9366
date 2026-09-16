@@ -2826,3 +2826,28 @@ partial ground truth here is being reported honestly as partial, not rounded up 
 Rework `focal_sift.c`/`tools/test_focal_verify.c` to pad the real 64x80 capture into a 96x96 canvas (centered,
 zero-padded) as the actual detection input, and use a 1.5x (not 2x) scale for the enlarged pass, then re-run
 the full 45-pair same/different-finger test and report the result plainly.
+
+## Applied the 96x96/1.5x fix -- separation problem PERSISTS, reporting honestly (2026-09-16)
+
+Status: Implemented the confirmed fix in `focal_sift.c` (centered zero-padding of the native 64x80 capture
+into a 96x96 canvas, 1.5x scale to 144x144 for the enlarged pass, replacing the previous 64x80-direct/2x-double
+geometry) and reran the full 45-pair same/different-finger test.
+
+### Result: still no separation, same qualitative character as before the fix
+```
+same-finger pairs:      n=15  avg=0.7086  min=0.5664  max=0.8584
+same-vs-different pairs: n=24  avg=0.7325  min=0.5373  max=0.8610
+different-vs-different:  n=6   avg=0.7437  min=0.6184  max=0.8082
+```
+Same-finger pairs score LOWEST on average (0.7086), different-finger pairs score HIGHEST (0.7437) --
+backwards, same direction of error seen throughout this entire session's debugging effort, just with a
+narrower/shifted absolute range than before the geometry fix. The 96x96/1.5x correction was real and confirmed
+(see previous entry), but it was NOT the (or not the only) root cause of the separation failure.
+
+### Implication: a full ground-truth keypoint/descriptor diff (the original Step 1-2 ask) is now more clearly
+### necessary, not less -- geometry alone does not explain the failure
+Since correcting a major, confirmed geometric error did not change the outcome's character, the remaining bug
+is likely NOT purely geometric (pyramid size/scale) -- it could be in keypoint localization specifics, the
+orientation/descriptor computation itself, or the matching stage's fundamental approach. Continuing to attempt
+completion of the full `FtGetTemplate` ground-truth dump (blocked on the `pData1`/`pData2` internal-buffer
+crash, previous entry) is the most direct remaining path to find it, rather than further isolated guesses.
