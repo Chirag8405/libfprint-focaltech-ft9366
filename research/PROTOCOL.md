@@ -842,3 +842,29 @@ if (Fw9366_cfg[2]!=0): sram_write(0x1807, 0x1671)   -- FIXED constant, no comput
 
 Live test: all three clean, zero timeouts (`05 fa 98 00 00 01 07 fe`, `05 fa 98 04 00 01 27 c8`,
 `05 fa 98 07 00 01 16 71`). `fdt_mode_init` now roughly 50% traced.
+
+## Update: fdt_mode_init continued -- 0x1808/0x1887(3rd)/Set_Scan_Rate_Default/0x1805, tested clean (2026-09-16)
+
+Status: CONFIRMED, tested live, zero timeouts, internal consistency verified across successive live reads
+
+```
+sram_write(0x1808, sram_bits_set(sram_bits_set(0x800,hi=7,lo=0,new=1), hi=0xa,lo=8,new=0))
+  = sram_write(0x1808, 0x0801)   -- Fw9366_cfg[2]!=0 branch confirmed always true
+sram_write(0x1887, sram_bits_set(0,hi=1,lo=0,new=5))
+  = sram_write(0x1887, 0x0001)   -- 2nd write to 0x1887 in fdt_mode_init (img_mode_init wrote 2 earlier)
+fw9366_Set_Scan_Rate_Default()   -- NEW, same pattern as Set_Scan_Rate_2M: 3 live read-modify-write ops,
+    no host-state dependency:
+  v=sram_read(0x1806); v=bits_set(v,13,7,0x13); sram_write(0x1806,v)
+  v=sram_read(0x180a); v=bits_set(v,13,7,0x13); v=bits_set(v,6,0,7); sram_write(0x180a,v)
+  v=sram_read(0x180b); v=bits_set(v,13,7,9); v=bits_set(v,6,0,0x11); sram_write(0x180b,v)
+if (REG9366[0x78]==1): [FALSE, REG9366[0x78]=0 confirmed via init_flag -- real-work path taken]
+v=sram_read(0x1805); v=bits_set(v,4,4,0); sram_write(0x1805,v)   -- another write to 0x1805
+```
+
+Live test: all clean, zero timeouts. Notable internal-consistency confirmation: `set_scan_rate_default()`'s
+live read of `0x180a` returned `0x0483` -- exactly what `set_scan_rate_2m()` had written moments earlier in
+this same run -- and correctly recomputed to `0x0987`; same pattern for `0x180b` (read `0x0208`, wrote
+`0x0491`). This confirms the whole chain of live read-modify-writes is behaving consistently, not just
+individually clean.
+
+`fdt_mode_init` now roughly 65% traced.

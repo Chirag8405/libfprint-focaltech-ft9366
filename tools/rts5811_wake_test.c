@@ -250,6 +250,31 @@ static int set_scan_rate_2m(libusb_device_handle *h)
     return 0;
 }
 
+/* fw9366_Set_Scan_Rate_Default(), traced at 0x155df0: same pattern as
+ * Set_Scan_Rate_2M -- three live read-modify-write ops, no host-state
+ * dependency. */
+static int set_scan_rate_default(libusb_device_handle *h)
+{
+    unsigned short v;
+    printf(" set_scan_rate_default(): 0x1806\n");
+    sram_read(h, 0x1806, &v);
+    v = sram_bits_set(v, 13, 7, 0x13);
+    sram_write(h, 0x1806, v);
+
+    printf(" set_scan_rate_default(): 0x180a\n");
+    sram_read(h, 0x180a, &v);
+    v = sram_bits_set(v, 13, 7, 0x13);
+    v = sram_bits_set(v, 6, 0, 7);
+    sram_write(h, 0x180a, v);
+
+    printf(" set_scan_rate_default(): 0x180b\n");
+    sram_read(h, 0x180b, &v);
+    v = sram_bits_set(v, 13, 7, 9);
+    v = sram_bits_set(v, 6, 0, 0x11);
+    sram_write(h, 0x180b, v);
+    return 0;
+}
+
 int main(void)
 {
     libusb_context *ctx = NULL;
@@ -606,7 +631,32 @@ int main(void)
     sram_write(h, 0x1804, 0x27c8);
     printf("-- fdt_mode_init: sram_write(0x1807, 0x1671) [2nd write to this addr, fixed constant] --\n");
     sram_write(h, 0x1807, 0x1671);
-    printf("\n== NOTE: fdt_mode_init still has more body after this point (~50%% remaining) ==\n");
+
+    /* --- fdt_mode_init CONTINUED (0x156c30-0x157082+) ---
+     *   sram_write(0x1808, sram_bits_set(sram_bits_set(0x800,hi=7,lo=0,new=1),
+     *       hi=0xa,lo=8,new=0))   -- Fw9366_cfg[2]!=0 branch (confirmed always true)
+     *     = sram_write(0x1808, 0x0801)
+     *   sram_write(0x1887, sram_bits_set(0,hi=1,lo=0,new=5))   -- Fw9366_cfg[2]!=0 branch
+     *     = sram_write(0x1887, 0x0001)   -- 2nd write to 0x1887 (img_mode_init wrote 2)
+     *   fw9366_Set_Scan_Rate_Default()   -- live RMW, no host-state dependency (see below)
+     *   if (REG9366[0x78] == 1): [FALSE -- REG9366[0x78]=0 confirmed via init_flag, so we
+     *       take the real-work path, not the dead-end log-and-exit branch]
+     *   v = sram_read(0x1805); v = bits_set(v,4,4,0); sram_write(0x1805, v)
+     *     -- live RMW; ANOTHER write to 0x1805 (already written by img_mode_init's tail) */
+    printf("-- fdt_mode_init: sram_write(0x1808, 0x0801) --\n");
+    sram_write(h, 0x1808, 0x0801);
+    printf("-- fdt_mode_init: sram_write(0x1887, 0x0001) [2nd write to this addr, img_mode_init wrote 2] --\n");
+    sram_write(h, 0x1887, 0x0001);
+    printf("-- fdt_mode_init: set_scan_rate_default() --\n");
+    set_scan_rate_default(h);
+    printf("-- fdt_mode_init: 0x1805 live read-modify-write (clear bit4) [another write to this addr] --\n");
+    {
+        unsigned short v = 0;
+        sram_read(h, 0x1805, &v);
+        v = sram_bits_set(v, 4, 4, 0);
+        sram_write(h, 0x1805, v);
+    }
+    printf("\n== NOTE: fdt_mode_init still has more body after this point (~35%% remaining) ==\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);
