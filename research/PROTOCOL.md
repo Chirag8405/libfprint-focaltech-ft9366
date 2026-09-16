@@ -2113,3 +2113,50 @@ labeled in the decompiler output; will resolve via the same intermediate-value v
 hand-mapping 9 push offsets by hand right now), but `FtResize_8u`'s position immediately before this stage in
 the pipeline is strong circumstantial support for `imgDbl=1` (OpenSIFT's `create_init_img` does exactly this
 doubling step when enabled).
+
+## FtGetMfsFeatures call graph mapped -- near-total OpenSIFT correspondence confirmed (2026-09-16)
+
+Status: CONFIRMED (real callee names extracted from disassembly, not inferred)
+
+Full list of named callees inside `FtGetMfsFeatures`, extracted directly from disassembly:
+```
+FtCreateInitImg   FtBuildGaussPyr   FtBuildDogPyr   FtScaleSpaceExtrema   FtCalcFeatureScales
+FtAdjustForImgDbl FtComputeDescriptors  FtDominantOri  FtSmoothOriHist  FtAddGoodOriFeatures
+FtMfsCalcGradMagOri
+FtCreateMemStorage  FtCreateSeq  FtSeqPush  FtSeqPop  FtSeqPopFront  FtGetSeqElem  FtSeqSort
+FtReleaseMemStorage  FtReleasePyr  FtClearDogPyr  FtReleaseImage
+FtGetKpNumMode4  FtInValidPixelSet     (no OpenSIFT equivalent -- FocalTech-specific, see below)
+```
+
+**Nearly every name maps 1:1 to OpenSIFT's actual internal function names**: `FtCreateInitImg`/
+`create_init_img`, `FtBuildGaussPyr`/`build_gauss_pyr`, `FtBuildDogPyr`/`build_dog_pyr`,
+`FtScaleSpaceExtrema`/`scale_space_extrema`, `FtCalcFeatureScales`/`calc_feature_scales`,
+`FtAdjustForImgDbl`/`adjust_for_img_dbl`, `FtDominantOri`/`FtSmoothOriHist`/`FtAddGoodOriFeatures` map to
+OpenSIFT's own internal orientation-assignment helpers (dominant-orientation peak finding, histogram
+smoothing, adding features for multiple strong orientation peaks), and `FtMfsCalcGradMagOri` matches OpenSIFT's
+`calc_grad_mag_ori` gradient helper. Beyond the algorithm itself, **`FtCreateMemStorage`/`FtCreateSeq`/
+`FtSeqPush`/`FtSeqPop`/`FtSeqPopFront`/`FtGetSeqElem`/`FtSeqSort`/`FtReleaseMemStorage` are functionally
+OpenCV's `CvMemStorage`/`CvSeq` container API** (`cvCreateMemStorage`/`cvCreateSeq`/`cvSeqPush`/etc.) -- which
+is exactly the dynamic keypoint-list container OpenSIFT itself uses internally. This is about as strong a
+correspondence as static analysis can establish without literal source access: FocalTech's detector is a
+ported/adapted OpenSIFT running on an OpenCV-CvSeq-equivalent container library, not an independent design.
+
+**Two genuinely FocalTech-specific additions, no OpenSIFT equivalent**: `FtGetKpNumMode4` (name suggests a
+sensor/mode-specific keypoint-count policy) and `FtInValidPixelSet` (very likely applies the
+already-traced `FtSegmentByLocalVariance` foreground mask and/or `FtBadPixselDetect` bad-pixel mask to exclude
+invalid image regions from keypoint consideration -- the natural integration point tying this stage to the
+earlier-traced preprocessing chain). `FtComputeDescriptors` appearing here (not only in `FtGetMfbFeatures`) is
+noted but not yet resolved -- possibly computes an intermediate gradient-histogram-based representation feeding
+`ST_FocalTemplate.templateBinDiscr` (distinct from each `ST_Feature.bDescri`, which is presumably
+`FtGetMfbFeatures`'s output) rather than a final descriptor; flagged as an open question for the
+`FtGetMfbFeatures` phase rather than guessed now.
+
+### Revised plan for the rest of Step 2
+Cross-reference each of these functions against OpenSIFT's actual public C source (`src/sift.c`, verified
+reachable via WebFetch) function-by-function, focusing effort on: (a) confirming stock behavior is unchanged
+where no customization is evident, (b) precisely nailing the two confirmed parameter deviations' effects
+(`contrThr=0.02`, `curvThr=15`), and (c) fully tracing the two FocalTech-specific functions
+(`FtGetKpNumMode4`, `FtInValidPixelSet`) and resolving the `FtComputeDescriptors`-in-two-places question --
+rather than disassembling every stock-equivalent function from zero as if its behavior were unknown. This
+meaningfully changes the Step 2 time estimate for the better versus the pre-discovery "weeks" framing, though
+the two FocalTech-specific functions and the descriptor-split question still require genuine RE.
