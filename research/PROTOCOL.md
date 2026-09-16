@@ -3287,3 +3287,25 @@ piece of the matching pipeline) rather than continuing to tune this reimplementa
 stand-in -- this is the one hypothesis in the list above that hasn't been directly tested against real
 ground truth at all, and the deliberate-deferral rationale ("standard technique, parameters can be tuned
 empirically") has now been empirically exhausted without success across six attempts.
+
+## Matching-stage architecture: confirmed a two-stage RANSAC pipeline, not a single pass (2026-09-16)
+
+Status: CONFIRMED via raw disassembly of `FtVerifyTwoTemplate`'s call sequence (offsets 0xc4b7b/0xc4be1).
+Scoping note for next session, not yet acted on further this session.
+
+`FtVerifyTwoTemplate` calls `FtRansacAngle_32f` (file offset 0xf67b0, 4101 bytes) first, then immediately
+`FtRansacEdage_32f` (0xf77c0, 5763 bytes), passing the Angle stage's output plus a global `gCorrectHMat`
+(0x30ef580) into the Edge stage. This is a genuine two-stage robust-estimation pipeline (likely: coarse
+rotation/angle-consensus RANSAC first, then a refined edge/point-consensus RANSAC using the first stage's
+result as a prior), not the single-pass plain-RANSAC that `focal_verify.c`'s `ransac_affine` implements. A
+third variant, `FtRansacEdage_32f_FT9391` (0xf8e50), is called from an earlier, separate branch gated by
+`FtSensorTypeGet()==0xa` -- almost certainly a different sensor family's code path, not applicable to FT9366.
+
+This is the clear next concrete step (recommended in the previous entry): fully disassemble
+`FtRansacAngle_32f` and `FtRansacEdage_32f` to understand the real two-stage consensus algorithm, rather than
+continuing to tune the current single-pass stand-in. This is a substantial undertaking (~10KB combined of dense
+floating-point disassembly, comparable in scope to the FtCalcSimScore trace but roughly 2x larger and split
+across two functions plus the glue logic between them) -- flagging the scope explicitly rather than starting
+it silently, since there's no guarantee it resolves the separation problem even after full replication (the
+"structural/geometric confound" hypothesis logged earlier remains a live alternative explanation that fuller
+RANSAC fidelity would not fix).
