@@ -1790,3 +1790,59 @@ algorithm family (unlike a from-scratch mystery algorithm), so the detection sta
 material available even though this exact implementation still needs to be traced from the binary. The binary
 descriptor computation (`FtGetMfbFeatures`) and the small-sensor-specific binarization variants are the more
 bespoke, FocalTech-specific parts requiring full RE from the binary with no external reference.
+
+## STEP 1 (reimplementation): FtNonLinearStretch_U8 fully traced (2026-09-16)
+
+Status: CONFIRMED (raw disassembly with DWARF-annotated register/parameter names via `r2 pdf`, cross-checked
+against `gdb ptype` signatures for every callee -- not decompiler-guessed). r2dec (`r2pm -ci r2dec`, now
+installed) was tried first for speed but its register-to-variable mapping was unreliable for args carried
+across many blocks; raw DWARF-annotated disassembly was used for the authoritative trace instead. r2dec
+remains useful as a fast first-pass overview for future functions, not as a final source of truth.
+
+### Real algorithm (first pipeline stage after FtCreateImage)
+
+```
+FtNonLinearStretch_U8(UINT8 *src, SINT32 rows, SINT32 cols, UINT8 *dst):
+  if src==NULL or dst==NULL: return -1
+  n = rows*cols
+  bufA = FP32[n]; bufB = FP32[n]; mask = UINT8[n]        (FtSafeAlloc, zeroed; return -2/-3 on alloc failure)
+  for i in 0..n-1:
+    bufA[i] = (float)src[i]
+    bufB[i] = (float)src[i]
+  FtImgBoxFilter(bufA, rows, cols, ksize=3, dst=bufA, normalize=1)   -- in-place 3x3 averaging box blur
+  FtImgBoxFilter(bufB, rows, cols, ksize=5, dst=bufB, normalize=1)   -- in-place 5x5 averaging box blur
+  for i in 0..n-1: bufA[i] -= bufB[i]                      -- band-pass: (3x3 blur) - (5x5 blur), DoG-like
+  curved_surface_img_normalize_32f_2_8u(bufA, rows, cols, alpha=0.0, beta=250.0, dst=normImg[n])
+                                                            -- min-max normalize float diff into byte [0,250]
+  for i in 0..n-1: mask[i] = (src[i] > 0xfa) ? 1 : 0        -- saturation mask from ORIGINAL src (>250)
+  curved_surface_img_localequalizehist_v2(src=normImg, mask=mask, rows, cols, dst=dst)
+                                                            -- local histogram equalization, mask-aware
+  FtImgGaussianblur(src=dst, rows, cols, ksize=3, sigma=-1.0 (auto), kernelPtr=NULL, dst=dst)
+                                                            -- in-place 3x3 gaussian blur, auto-computed sigma
+  for i in 0..n-1: if mask[i] != 0: dst[i] = 0xfe           -- force originally-saturated pixels to 254
+  free bufA, bufB, mask
+  return 9   -- CONFIRMED success sentinel is 9, not 0 (verified in disassembly, not assumed)
+```
+
+This is a local-contrast-enhancement filter (difference-of-box-blurs bandpass, i.e. DoG-like, akin to unsharp
+masking) followed by masked local histogram equalization and a final smoothing blur, with explicit saturated-
+pixel handling. Not a simple global contrast stretch despite the function name.
+
+### Real signatures recovered (all via `gdb ptype`, parameter NAMES via DWARF-annotated `r2 pdf` comments)
+```c
+int  FtImgBoxFilter(FP32 *src, SINT32 rows, SINT32 cols, SINT32 ksize, FP32 *dst, UINT8 normalize);
+int  FtImgGaussianblur(UINT8 *src, SINT32 rows, SINT32 cols, SINT32 ksize, FP32 sigma, SINT32 *kernelPtr, UINT8 *dst);
+void curved_surface_img_normalize_32f_2_8u(FP32 *src, SINT32 rows, SINT32 cols, FP32 alpha, FP32 beta, UINT8 *dst);
+int  curved_surface_img_localequalizehist_v2(UINT8 *src, UINT8 *mask, SINT32 rows, SINT32 cols, UINT8 *dst);
+```
+These four are shared image-utility primitives (the `curved_surface_img_` prefix suggests a distinct internal
+utility library) -- almost certainly reused by the other preprocessing stages (`FtLocalContrastEnhance` etc.)
+still to be traced. Plan: trace these primitives' own internals ONCE, then treat later pipeline stages as
+compositions of already-understood primitives rather than re-deriving box-filter/gaussian-blur/histogram-eq
+logic from scratch each time.
+
+### Not yet done for this function
+Internal logic of the four callees above is not yet traced (next). No live/intermediate-value validation
+against the real .so yet -- deferred until enough of the pipeline is reimplemented to compare a real
+end-to-end intermediate buffer (per Step 1's own validation methodology: dump intermediate buffers from the
+real .so via gdb for the same input image, diff against our reimplementation).
