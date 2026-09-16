@@ -1103,3 +1103,60 @@ This completes `fw9366_fdt_base_Stable_Update`'s entire direct call list (`fdt_b
 `fdt_manual_start`, `fdt_get_a_frame_data`, `fw9392_fdt_base_fail_check`, `fdt_base_Min_Updata` -- all now
 traced). Next: `fw9366_img_base_Update` (the second direct child of `fw9366_Update_Base`, not yet started --
 contains `fw9366_img_data_get`, `find_max_min_avg_1218`, and its own `fw9366_AutoSDacUpdate`).
+
+## MAJOR MILESTONE: real image capture pipeline working end-to-end (2026-09-16)
+
+Status: CONFIRMED (static disassembly + live hardware test) -- first successful large structured data capture
+
+### New primitives traced and integrated
+
+`fw9366_fifo_read(addr, out_buf, len)` (0x166891): opcode `[0x06, 0xf9]`, same address encoding as sram_read,
+general length-field encoding (see below), but **no -2 adjustment** (unlike sram_read_bulk_withecc) -- actual
+bytes read equals `len` exactly, confirmed from disassembly. Uses a different low-level transport
+(`ff_spi_read_image_buf` vs `ff_spi_write_then_read_buf_rts`) but confirmed structurally identical (same
+`User_TL_Transmit_N_Byte` write/read pair, same bulk EP 0x01/0x82) -- no special large-transfer handling
+needed; `libusb_bulk_transfer` already handles multi-packet transfers transparently.
+
+**General length-field encoding, re-derived and corrected**: `half = len/2`, stored **big-endian**
+(`byte_hi = (half>>8)&0xff`, `byte_lo = half&0xff`). This corrects an earlier simplification in
+`sram_read_bulk_withecc` that only happened to work because its lengths were always small (half<256) --
+verified the general formula against both previously-confirmed small cases (len=2->`00 01`, len=8->`00 04`)
+before using it for large image-chunk lengths (half up to 5120 for a 10240-byte chunk, which does NOT fit in
+one byte -- would have silently produced wrong bytes with the old shortcut).
+
+`fw9366_image_read(out_buf, param)` (0x166a5b): param clamped to [0,5] (0->1), `total_len = param*5*2048`
+bytes, read in chunks of up to 10240 bytes via `fifo_read(0x1a05, ...)` -- the SAME fixed address every chunk
+(a streaming FIFO port, not a growing memory range, consistent with the function's name).
+
+`fw9366_img_scan_start()` (0x15c4ab): calls `img_mode_init(0)` AGAIN (a second real invocation -- confirmed
+via disassembly reachability that this call site is genuinely part of the real chain, correcting an earlier
+dismissal of it as "later-phase only"), `wm_switch(3)`, polls `wm_get()` up to 10x for `0x54`, sets bit 0 of
+`0x1800`, sleeps 1ms.
+
+`fw9366_img_scan_end()` (0x15c5bf): `intflag_clear(FW9366_INT_INDEX[5]=0x20)`.
+
+`fw9366_img_data_get(out_buf, param)` (0x15c64d): `img_scan_start()` -> `image_read()` -> `img_scan_end()`.
+
+### LIVE HARDWARE TEST -- full real image capture, no finger present (baseline)
+
+```
+img_scan_start: wm_switch(3) -> c4 3b 00 (table entry for mode 3, confirmed)
+img_scan_start: wm_get() -> 0x54 on the FIRST attempt (no retries needed -- clean signal)
+img_scan_start: 0x1800 read (4ffe) -> bit0 set -> write 4fff
+image_read: fifo_read(0x1a05, len=10240) -> sent: 06 f9 9a 05 14 00
+  recv: 10240 bytes, ALL CLEAN (zero timeout/error)
+  nonzero=9900/10240, min=0x00, max=0xff, avg=66.4
+  first bytes: 00 00 08 7f 08 6d 08 67 08 8f 07 f8 08 bc 08 7b 09 0b 09 de 09 6a 0a 61 ...
+img_scan_end: intflag_clear(0x20) -> clean
+```
+
+This is a categorically different result from the earlier 8-byte all-zero "frame data" -- this is a large,
+structured, highly non-trivial data capture. The pattern (consistent high byte ~0x08-0x09 with varying low
+byte, repeating across the buffer) is exactly what would be expected from packed 12-16 bit sensor ADC/pixel
+readings, not noise or a garbage/error response.
+
+**Honest interpretation**: this confirms the FULL capture pipeline (mode switch -> scan arm -> bulk image
+transfer -> scan end) works correctly at the wire level and pulls real, structured data off the sensor. It
+does NOT yet confirm this specific capture is a fingerprint pattern versus a no-finger baseline/dark
+reference -- that requires a live touch comparison, not yet done. Next action: repeat this exact capture
+while physically touching the sensor and compare.

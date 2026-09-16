@@ -42,7 +42,28 @@ static int bulk_read(libusb_device_handle *h, unsigned char *buf, int len)
     int transferred = 0;
     int r = libusb_bulk_transfer(h, EP_IN, buf, len, &transferred, TIMEOUT_MS);
     printf("  bulk_read  -> ret=%d (%s) transferred=%d\n", r, libusb_error_name(r), transferred);
-    if (r == 0 && transferred > 0) hexdump("  recv", buf, transferred);
+    if (r == 0 && transferred > 0) {
+        if (transferred <= 64) {
+            hexdump("  recv", buf, transferred);
+        } else {
+            /* Large transfer (e.g. an image chunk) -- avoid flooding the
+             * terminal with a full hexdump; show a short preview plus
+             * basic stats useful for judging whether the data looks real
+             * (varied) vs. flat/empty. */
+            hexdump("  recv (first 32 bytes)", buf, 32);
+            unsigned int sum = 0, nonzero = 0;
+            unsigned char minv = 0xff, maxv = 0;
+            for (int i = 0; i < transferred; i++) {
+                unsigned char b = buf[i];
+                sum += b;
+                if (b != 0) nonzero++;
+                if (b < minv) minv = b;
+                if (b > maxv) maxv = b;
+            }
+            printf("  [%d bytes total] nonzero=%u/%d min=0x%02x max=0x%02x avg=%.1f\n",
+                   transferred, nonzero, transferred, minv, maxv, (double)sum / transferred);
+        }
+    }
     return r;
 }
 
@@ -125,28 +146,63 @@ static int sram_read(libusb_device_handle *h, unsigned short addr, unsigned shor
     return 0;
 }
 
+/* General length-field encoding used by both sram_read_bulk_withecc and
+ * fw9366_fifo_read: half = len/2, stored BIG-ENDIAN as two bytes
+ * (high-byte-of-half first, low-byte-of-half second). Re-derived precisely
+ * (not just pattern-matched) after noticing the original simplified
+ * "cmd[5]=half as one byte" shortcut only happened to work for the small
+ * lengths tested so far (half<256) -- it silently breaks for real image
+ * chunk sizes (e.g. half=5120 for a 10240-byte chunk, which doesn't fit
+ * in one byte). Verified against both previously-confirmed small cases
+ * (len=2 -> 00 01, len=8 -> 00 04) before use. */
+static void encode_len_field(unsigned short len, unsigned char *b_hi, unsigned char *b_lo)
+{
+    unsigned short half = (unsigned short)(len / 2);
+    *b_hi = (unsigned char)((half >> 8) & 0xff);
+    *b_lo = (unsigned char)(half & 0xff);
+}
+
 /* fw9366_sram_read_bulk_withecc(addr, out_buf, len_words), traced at
- * 0x1666cb: same address encoding as sram_read/write, but a dynamic
- * length field (same divide-by-2 encoding already validated for the fixed
- * len=2 case elsewhere) and a variable-length bulk read straight into the
- * caller's buffer. IMPORTANT: the actual bytes read back is (len_words-2),
- * not len_words -- confirmed from the disassembly's internal length
- * variable, not assumed. */
+ * 0x1666cb: same address encoding as sram_read/write, dynamic length
+ * field (general formula above). IMPORTANT: the actual bytes read back is
+ * (len_words-2), not len_words -- confirmed from the disassembly's
+ * internal length variable, not assumed. */
 static int sram_read_bulk_withecc(libusb_device_handle *h, unsigned short addr,
                                     unsigned char *out_buf, unsigned short len_words)
 {
-    unsigned char hi, lo;
+    unsigned char hi, lo, len_hi, len_lo;
     sram_encode_addr(addr, &hi, &lo);
     unsigned short internal_len = (unsigned short)(len_words - 2);
-    /* Same "divide by 2, sign-corrected" length encoding already validated
-     * via the fixed len=2 case elsewhere (which produced bytes 00 01,
-     * i.e. half=1 stored as the high byte of the mid-field with the low
-     * byte always 0x00). Here half is dynamic. */
-    unsigned char half = (unsigned char)(internal_len / 2);
-    unsigned char cmd[6] = { 0x04, 0xfb, hi, lo, 0x00, half };
+    encode_len_field(internal_len, &len_hi, &len_lo);
+    unsigned char cmd[6] = { 0x04, 0xfb, hi, lo, len_hi, len_lo };
     printf(" sram_read_bulk_withecc(0x%04x, len_words=%u -> actual %u bytes):\n", addr, len_words, internal_len);
     int wr = bulk_write(h, cmd, sizeof(cmd));
     int rr = bulk_read(h, out_buf, internal_len);
+    if (wr != 0 || rr != 0) return -1;
+    return 0;
+}
+
+/* fw9366_fifo_read(addr, out_buf, len), traced at 0x166891: opcode
+ * [0x06, 0xf9], same address encoding, general length-field encoding
+ * (see encode_len_field). UNLIKE sram_read_bulk_withecc, there is NO -2
+ * adjustment here -- the actual bytes read back equals len exactly,
+ * confirmed by the disassembly not applying any subtraction to the
+ * length variable before it's used as both the field-encoding input and
+ * the final USB read length. Uses a different low-level transport
+ * (ff_spi_read_image_buf vs ff_spi_write_then_read_buf_rts) but it's
+ * structurally identical (same User_TL_Transmit_N_Byte write/read pair,
+ * same bulk EP 0x01/0x82) -- no special large-transfer handling needed;
+ * libusb_bulk_transfer already handles multi-packet transfers. */
+static int fifo_read(libusb_device_handle *h, unsigned short addr,
+                       unsigned char *out_buf, unsigned int len)
+{
+    unsigned char hi, lo, len_hi, len_lo;
+    sram_encode_addr(addr, &hi, &lo);
+    encode_len_field((unsigned short)len, &len_hi, &len_lo);
+    unsigned char cmd[6] = { 0x06, 0xf9, hi, lo, len_hi, len_lo };
+    printf(" fifo_read(0x%04x, len=%u):\n", addr, len);
+    int wr = bulk_write(h, cmd, sizeof(cmd));
+    int rr = bulk_read(h, out_buf, (int)len);
     if (wr != 0 || rr != 0) return -1;
     return 0;
 }
@@ -230,6 +286,7 @@ static int fdt_get_a_frame_data(libusb_device_handle *h, unsigned char *out_buf)
     }
     return 0;
 }
+
 
 /* fw9392_fdt_base_fail_check(data), traced at 0x155d26: pure local, no I/O.
  * The real function reads each entry as a native (little-endian x86)
@@ -376,6 +433,114 @@ static int set_scan_rate_2m(libusb_device_handle *h)
     v = sram_bits_set(v, 6, 0, 8);
     sram_write(h, 0x180b, v);
     return 0;
+}
+
+/* fw9366_img_mode_init(0), traced at 0x15b8a9 -- fully traced, 100%, and
+ * tested clean against real hardware (see research/PROTOCOL.md). Factored
+ * out as a real function since fw9366_img_scan_start also calls it (a
+ * second invocation, with fw9366_context[0xfc] now at 0xa1 rather than
+ * 0xa0 -- but the function's OWN internal gate checks against 0xa3, so a
+ * second call at state 0xa1 still runs the full body again, identically). */
+static void img_mode_init_0(libusb_device_handle *h)
+{
+    printf("-- img_mode_init(0) opening: idle_enter() again --\n");
+    idle_enter(h);
+    printf("-- img_mode_init(0): sram_write(0x1801, 0xfcb6) [REG9366[0x87]=0x36] --\n");
+    sram_write(h, 0x1801, 0xfcb6);
+    printf("-- img_mode_init(0): sram_write(0x1800, 0x4ffe) [fixed constant, param==0 branch] --\n");
+    sram_write(h, 0x1800, 0x4ffe);
+    printf("-- img_mode_init(0): sram_write(0x1804, 0x27ca) --\n");
+    sram_write(h, 0x1804, 0x27ca);
+    printf("-- img_mode_init(0): set_scan_rate_2m() --\n");
+    set_scan_rate_2m(h);
+    printf("-- img_mode_init(0): sram_write(0x1807, 0x18e1) --\n");
+    sram_write(h, 0x1807, 0x18e1);
+    printf("-- img_mode_init(0): sram_write(0x1887, 2) --\n");
+    sram_write(h, 0x1887, 2);
+    printf("-- img_mode_init(0): 0x1805 live read-modify-write (clear low byte) --\n");
+    {
+        unsigned short v = 0;
+        sram_read(h, 0x1805, &v);
+        v = sram_bits_set(v, 4, 0, 0);
+        v = sram_bits_set(v, 7, 5, 0);
+        sram_write(h, 0x1805, v);
+    }
+    printf("-- img_mode_init(0): 0x1811 live read-modify-write --\n");
+    {
+        unsigned short v = 0;
+        sram_read(h, 0x1811, &v);
+        v = sram_bits_set(v, 9, 0, 0x1fe);
+        sram_write(h, 0x1811, v);
+    }
+    printf("-- img_mode_init(0): intflag_mask(5) --\n");
+    intflag_mask(h, 5);
+    printf("-- img_mode_init(0): intflag_mask(6) --\n");
+    intflag_mask(h, 6);
+    printf("-- img_mode_init(0): int_gap_set(0x64) --\n");
+    int_gap_set(h, 0x64);
+    printf("-- img_mode_init(0): wdtcnt_gap_set(0x7d0) --\n");
+    wdtcnt_gap_set(h, 0x7d0);
+    printf("-- [img_mode_init(0) COMPLETE] --\n");
+}
+
+/* fw9366_img_scan_start(), traced at 0x15c4ab: calls img_mode_init(0)
+ * again, wm_switch(3), polls wm_get() up to 10 times waiting for 0x54,
+ * then sets bit 0 of 0x1800 and sleeps 1ms. */
+static void img_scan_start(libusb_device_handle *h)
+{
+    img_mode_init_0(h);
+    printf("-- img_scan_start: wm_switch(3) --\n");
+    wm_switch(h, 3);
+    unsigned char wm = 0;
+    int tries = 10;
+    do {
+        wm_get(h, &wm);
+        printf("-- img_scan_start: wm_get() = 0x%02x --\n", wm);
+        if (wm == 0x54) break;
+        tries--;
+    } while (tries != 0);
+    printf("-- img_scan_start: 0x1800 set bit0 --\n");
+    unsigned short v = 0;
+    sram_read(h, 0x1800, &v);
+    v = sram_bits_set(v, 0, 0, 1);
+    sram_write(h, 0x1800, v);
+    usleep(1 * 1000);
+}
+
+/* fw9366_img_scan_end(), traced at 0x15c5bf: intflag_clear(FW9366_INT_INDEX[5]=0x20). */
+static void img_scan_end(libusb_device_handle *h)
+{
+    printf("-- img_scan_end: intflag_clear(0x20) --\n");
+    sram_write(h, 0x1a84, 0x20); /* intflag_clear(mask) = sram_write(0x1a84, mask) */
+}
+
+/* fw9366_image_read(out_buf, param), traced at 0x166a5b: param clamped to
+ * [0,5] (0 mapped to 1), total_len = param*5*2048, read in chunks of up
+ * to 0x2800(10240) bytes via fifo_read(0x1a05, ...) (fixed FIFO address
+ * every chunk -- a streaming read port, not a growing memory range),
+ * each chunk copied into out_buf sequentially. out_buf must be large
+ * enough for total_len bytes (up to 10240 for param<=1). */
+static void image_read(libusb_device_handle *h, unsigned char *out_buf, int param)
+{
+    if (param > 5) param = 5;
+    if (param == 0) param = 1;
+    unsigned int total_len = (unsigned int)param * 5u * 2048u;
+    unsigned int offset = 0;
+    printf("-- image_read: param=%d total_len=%u --\n", param, total_len);
+    while (total_len > 0) {
+        unsigned int chunk = (total_len > 10240) ? 10240 : total_len;
+        fifo_read(h, 0x1a05, out_buf + offset, chunk);
+        offset += chunk;
+        total_len -= chunk;
+    }
+}
+
+/* fw9366_img_data_get(out_buf, param), traced at 0x15c64d. */
+static void img_data_get(libusb_device_handle *h, unsigned char *out_buf, int param)
+{
+    img_scan_start(h);
+    image_read(h, out_buf, param);
+    img_scan_end(h);
 }
 
 /* fw9366_Set_Scan_Rate_Default(), traced at 0x155df0: same pattern as
@@ -675,61 +840,10 @@ int main(void)
      *     = sram_write(0x1807, 0x18e1)   -- Fw9366_cfg[0xc]=0xc8 confirmed
      *       (this session's earlier smic_flag=0 live measurement), Fw9366_cfg[2]=1 confirmed
      *
-     * Remaining ~75% of img_mode_init's body still NOT traced -- stopping
-     * integration at this point, same honest-gap policy as before. */
-    printf("-- img_mode_init(0) opening: idle_enter() again --\n");
-    idle_enter(h);
-    printf("-- img_mode_init(0): sram_write(0x1801, 0xfcb6) [REG9366[0x87]=0x36, happens BEFORE fdt_mode_init's own 0x1801 write] --\n");
-    sram_write(h, 0x1801, 0xfcb6);
-    printf("-- img_mode_init(0): sram_write(0x1800, 0x4ffe) [fixed constant, param==0 branch] --\n");
-    sram_write(h, 0x1800, 0x4ffe);
-    printf("-- img_mode_init(0): sram_write(0x1804, 0x27ca) --\n");
-    sram_write(h, 0x1804, 0x27ca);
-    printf("-- img_mode_init(0): set_scan_rate_2m() --\n");
-    set_scan_rate_2m(h);
-    printf("-- img_mode_init(0): sram_write(0x1807, 0x18e1) --\n");
-    sram_write(h, 0x1807, 0x18e1);
-
-    /* --- img_mode_init(0) CONTINUED to completion (0x15c02a-0x15c4aa) ---
-     *   sram_write(0x1887, sram_bits_set(0, hi=2,lo=0,new=2))   -- since
-     *       Fw9366_cfg[2]!=0 (confirmed always true) = sram_write(0x1887, 2)
-     *   if (REG9366[0x77] != 1): [TRUE, since REG9366[0x77]=0 confirmed]
-     *     v = sram_read(0x1805); v = bits_set(v,4,0,0); v = bits_set(v,7,5,0);
-     *     sram_write(0x1805, v)   -- clears the low byte, live read-modify-write
-     *   v = sram_read(0x1811); v = bits_set(v,9,0,0x1fe); sram_write(0x1811, v)
-     *       -- live read-modify-write
-     *   intflag_mask(5); intflag_mask(6)
-     *   REG9366[0x77] = 1   -- host-side only, no wire effect (flips the
-     *       guard that gated THIS call; irrelevant to the current invocation)
-     *   int_gap_set(0x64)
-     *   wdtcnt_gap_set(0x7d0)
-     * This is the END of img_mode_init(0) -- function fully traced, 100%. */
-    printf("-- img_mode_init(0): sram_write(0x1887, 2) --\n");
-    sram_write(h, 0x1887, 2);
-    printf("-- img_mode_init(0): 0x1805 live read-modify-write (clear low byte) --\n");
-    {
-        unsigned short v = 0;
-        sram_read(h, 0x1805, &v);
-        v = sram_bits_set(v, 4, 0, 0);
-        v = sram_bits_set(v, 7, 5, 0);
-        sram_write(h, 0x1805, v);
-    }
-    printf("-- img_mode_init(0): 0x1811 live read-modify-write --\n");
-    {
-        unsigned short v = 0;
-        sram_read(h, 0x1811, &v);
-        v = sram_bits_set(v, 9, 0, 0x1fe);
-        sram_write(h, 0x1811, v);
-    }
-    printf("-- img_mode_init(0): intflag_mask(5) --\n");
-    intflag_mask(h, 5);
-    printf("-- img_mode_init(0): intflag_mask(6) --\n");
-    intflag_mask(h, 6);
-    printf("-- img_mode_init(0): int_gap_set(0x64) --\n");
-    int_gap_set(h, 0x64);
-    printf("-- img_mode_init(0): wdtcnt_gap_set(0x7d0) --\n");
-    wdtcnt_gap_set(h, 0x7d0);
-    printf("-- [img_mode_init(0) COMPLETE -- fully traced, 100%%] --\n\n");
+     * Now factored into img_mode_init_0(), defined above main() -- also
+     * reused by img_scan_start(). */
+    img_mode_init_0(h);
+    printf("\n");
 
     printf("-- sram_write(0x1801, 0xfc9b) --\n");
     sram_write(h, 0x1801, 0xfc9b);
@@ -874,6 +988,16 @@ int main(void)
     fdt_base_min_updata(frame_buf, &crc1, &crc2);
     printf("  crc1 (-> REG9366+0xca) = 0x%04x\n", crc1);
     printf("  crc2 (-> REG9366+0xb6) = 0x%04x\n", crc2);
+
+    /* --- fw9366_img_data_get(param=0) -- REAL IMAGE CAPTURE, fully traced.
+     * This is the actual raw fingerprint image read path (up to 10240
+     * bytes for param=0->1), distinct from the small 8-byte calibration
+     * "frame data" tested earlier. First test run with no finger placed,
+     * to establish a baseline before any touch-based comparison. */
+    printf("\n== fw9366_img_data_get(param=0) -- REAL IMAGE CAPTURE (baseline, no finger) ==\n");
+    static unsigned char image_buf[10240];
+    img_data_get(h, image_buf, 0);
+    printf("== image capture complete ==\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);
