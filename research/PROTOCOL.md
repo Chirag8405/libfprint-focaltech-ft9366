@@ -1671,3 +1671,11 @@ user for a decision rather than unilaterally committing to one:
    already tried and shown not to separate finger identity) -- closer to what real small capacitive sensors
    in phones/laptops actually do, since minutiae-based approaches are known in the fingerprint literature to
    fail on small-area sensors for exactly the reason observed here.
+
+### Decision: pursue vendor matcher reverse-engineering (2026-09-16)
+User chose to reverse-engineer the vendor's own proprietary matching algorithm (`FtVerifyByTemplate`/
+`focal_GetImageTemplate`) rather than multi-frame stitching or a custom small-area patch matcher, given it's
+the only approach already proven to work at this sensor's actual resolution. Scope acknowledged upfront as a
+real multi-day sub-project, not a quick fix. Starting with symbol enumeration and call-graph mapping in
+`~/focaltech-ft9366-arch-shim/libfprint-2.so.2.0.0` before any linear tracing, per this session's standing
+methodology.
