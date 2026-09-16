@@ -821,3 +821,24 @@ was called out at the very start of this session as the concrete next blocker af
 Return to `fw9366_fdt_mode_init`'s remaining ~60% (picking up right after the `img_mode_init(0)` call site,
 which is now fully resolved) -- the `0x1801`/`0x180c`/`0x1881` writes already confirmed are what comes AFTER
 this point in the real sequence.
+
+## Update: fdt_mode_init continued past context[0xfc]=0xa1, tested clean (2026-09-16)
+
+Status: CONFIRMED, tested live, zero timeouts
+
+Three more writes resolved, all further writes to addresses img_mode_init already touched -- same
+multiple-writes-to-same-address pattern caught twice already this session, preserved in real order:
+
+```
+sram_write(0x1800, sram_bits_set(sram_bits_set(0,hi=0xa,lo=1,new=0x3ff), hi=0xe,lo=0xb,new=0))
+  = sram_write(0x1800, 0x07fe)   -- Fw9366_cfg[2]!=0 branch (confirmed always true);
+    2nd write to 0x1800 (img_mode_init wrote 0x4ffe)
+sram_write(0x1804, sram_bits_set(0x27c8, hi=2,lo=0,new=Fw9366_cfg[1]-1))
+  = sram_write(0x1804, 0x27c8)   -- Fw9366_cfg[1]=0x01 confirmed via cfg_init;
+    3rd write to 0x1804 total (img_mode_init wrote 0x27ca -- differs by exactly ONE BIT)
+if (Fw9366_cfg[2]!=0): sram_write(0x1807, 0x1671)   -- FIXED constant, no computation;
+    2nd write to 0x1807 (img_mode_init wrote 0x18e1)
+```
+
+Live test: all three clean, zero timeouts (`05 fa 98 00 00 01 07 fe`, `05 fa 98 04 00 01 27 c8`,
+`05 fa 98 07 00 01 16 71`). `fdt_mode_init` now roughly 50% traced.

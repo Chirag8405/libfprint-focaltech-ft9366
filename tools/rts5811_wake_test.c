@@ -584,7 +584,29 @@ int main(void)
     sram_write(h, 0x180c, 0x0000);
     printf("-- sram_write(0x1881, 0x0f0c) --\n");
     sram_write(h, 0x1881, 0x0f0c);
-    printf("\n== NOTE: this is invocation A1's confirmed sequence up to the point fdt_mode_init sets context[0xfc]=0xa1; img_mode_init(0) and the remaining ~60%% of fdt_mode_init's body are still not integrated ==\n");
+    printf("-- [fdt_mode_init: fw9366_context[0xfc] = 0xa1 -- host-side only, no wire effect] --\n\n");
+
+    /* --- fdt_mode_init CONTINUED after context[0xfc]=0xa1 (0x156853-0x156c26) ---
+     * All three below are FURTHER writes to addresses already written by
+     * img_mode_init(0) above -- same "multiple writes to the same address"
+     * pattern already caught twice this session; preserved in order, not
+     * collapsed.
+     *   sram_write(0x1800, sram_bits_set(sram_bits_set(0,hi=0xa,lo=1,new=0x3ff),
+     *       hi=0xe,lo=0xb,new=0))   -- Fw9366_cfg[2]!=0 branch (confirmed always true)
+     *     = sram_write(0x1800, 0x07fe)   -- 2nd write to 0x1800 (img_mode_init wrote 0x4ffe)
+     *   sram_write(0x1804, sram_bits_set(0x27c8, hi=2,lo=0,new=Fw9366_cfg[1]-1))
+     *     = sram_write(0x1804, 0x27c8)   -- Fw9366_cfg[1]=0x01 confirmed via cfg_init;
+     *       3rd write to 0x1804 total (img_mode_init wrote 0x27ca -- differs by ONE BIT,
+     *       easy to miss if collapsed)
+     *   if (Fw9366_cfg[2]!=0): sram_write(0x1807, 0x1671)   -- FIXED constant, no
+     *       bits_set computation at all; 2nd write to 0x1807 (img_mode_init wrote 0x18e1) */
+    printf("-- fdt_mode_init: sram_write(0x1800, 0x07fe) [2nd write to this addr] --\n");
+    sram_write(h, 0x1800, 0x07fe);
+    printf("-- fdt_mode_init: sram_write(0x1804, 0x27c8) [3rd write to this addr, differs by 1 bit from img_mode_init's 0x27ca] --\n");
+    sram_write(h, 0x1804, 0x27c8);
+    printf("-- fdt_mode_init: sram_write(0x1807, 0x1671) [2nd write to this addr, fixed constant] --\n");
+    sram_write(h, 0x1807, 0x1671);
+    printf("\n== NOTE: fdt_mode_init still has more body after this point (~50%% remaining) ==\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);
