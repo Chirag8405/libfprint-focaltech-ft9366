@@ -868,3 +868,47 @@ this same run -- and correctly recomputed to `0x0987`; same pattern for `0x180b`
 individually clean.
 
 `fdt_mode_init` now roughly 65% traced.
+
+## Update: fdt_mode_init loop resolved via radare2 CFG analysis, tested clean (2026-09-16)
+
+Status: CONFIRMED (radare2 control-flow analysis + live hardware test, zero timeouts)
+
+### Tooling note
+Installed `radare2` mid-session specifically to resolve a real control-flow ambiguity that linear disassembly
+reading could not confidently settle: address `0xC0` appeared to be computed a second time (`rbp-1 + 0xc0`),
+suggesting either a loop or a genuine revisit. `r2`'s basic-block graph (`afb` on the function) showed a
+backward edge from `0x157c10` to `0x1577b8`, confirming a loop, and the increment instruction at `0x157c10`
+(`add BYTE[rbp-1], 0x9`) showed the counter advances by 9 per iteration, not 1.
+
+### Resolved: 0x180d chaining + 0x1888 + sfr_write(0x9a) + the loop
+
+```
+sram_write(0x180d, sram_bits_set(<0x1805's just-computed value>, hi=9,lo=0,new=0x384))
+  -- IMPORTANT: base is NOT fresh, it's the exact value already computed for the 0x1805 write
+     immediately prior -- a compiler register/stack-slot reuse artifact, confirmed by the absence
+     of any intervening read/reset of that local before this use.
+v=sram_read(0x1888); v=bits_set(v,9,2,0); sram_write(0x1888,v)   -- fresh, independent
+sfr_write(0x9a, 0x5a)   -- direct fixed-value SFR write, no SRAM involved
+
+Loop (0x157373-0x157c19), Fw9366_cfg[2]!=0 branch (confirmed always true):
+  Pre-loop, computed once: bitfield_hi = 0x2224>>3 = 0x444, bitfield_lo = 0x2224&7 = 4;
+    separately, fixed_field = 4-1 = 3
+  for i in {0, 9, 18}:   -- counter starts at 0, +9 per iteration, bound <=0x13(19) -> exactly 3 iterations
+    addr1 = 0xbf+i: v=sram_read; v=bits_set(v,12,0,0x444); sram_write
+    addr2 = 0xc0+i: v=sram_read; v=bits_set(v,5,3,4); v=bits_set(v,1,0,1); sram_write
+    addr3 = 0xc1+i: v=sram_read; v=bits_set(v,7,6,3); sram_write
+```
+
+### Live hardware test -- all clean, zero timeouts, full loop executed correctly
+
+All 9 register read-modify-writes across the 3 iterations completed at exactly the predicted addresses
+(0xbf/0xc0/0xc1, 0xc8/0xc9/0xca, 0xd1/0xd2/0xd3), each showing real live-read values correctly transformed.
+
+`fdt_mode_init` now roughly 85% traced.
+
+### Methodology note
+This is the clearest example yet of why the "map state/control-flow before tracing linearly" discipline
+matters: a purely linear read would very likely have either mis-treated the repeated `0xC0`-style address
+computation as a copy-paste artifact (silently dropping 6 of the 9 real writes) or guessed at a wrong loop
+bound. Installing a decompiler-adjacent tool (radare2) once linear reading hit genuine ambiguity, rather than
+guessing, resolved it with certainty.

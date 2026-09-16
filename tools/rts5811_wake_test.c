@@ -650,13 +650,67 @@ int main(void)
     printf("-- fdt_mode_init: set_scan_rate_default() --\n");
     set_scan_rate_default(h);
     printf("-- fdt_mode_init: 0x1805 live read-modify-write (clear bit4) [another write to this addr] --\n");
+    unsigned short v_1805 = 0;
+    sram_read(h, 0x1805, &v_1805);
+    v_1805 = sram_bits_set(v_1805, 4, 4, 0);
+    sram_write(h, 0x1805, v_1805);
+
+    /* --- fdt_mode_init CONTINUED (0x1570cd-0x157360) ---
+     * IMPORTANT: 0x180d's base value is NOT fresh -- it's a compiler
+     * register-reuse artifact that chains directly from 0x1805's
+     * just-computed value above (confirmed via careful disassembly
+     * reading: no intervening read/reset of that local before use here).
+     * 0x1888 is a fresh, independent read. sfr_write(0x9a,0x5a) is a
+     * direct fixed-value SFR write (no SRAM involved). */
+    printf("-- fdt_mode_init: sram_write(0x180d, ...) [CHAINED from 0x1805's value, not fresh] --\n");
+    sram_write(h, 0x180d, sram_bits_set(v_1805, 9, 0, 0x384));
+    printf("-- fdt_mode_init: 0x1888 live read-modify-write (fresh) --\n");
     {
         unsigned short v = 0;
-        sram_read(h, 0x1805, &v);
-        v = sram_bits_set(v, 4, 4, 0);
-        sram_write(h, 0x1805, v);
+        sram_read(h, 0x1888, &v);
+        v = sram_bits_set(v, 9, 2, 0);
+        sram_write(h, 0x1888, v);
     }
-    printf("\n== NOTE: fdt_mode_init still has more body after this point (~35%% remaining) ==\n");
+    printf("-- fdt_mode_init: sfr_write(0x9a, 0x5a) --\n");
+    sfr_write(h, 0x9a, 0x5a);
+
+    /* --- fdt_mode_init: 3-iteration loop (0x157373-0x157c19), resolved
+     * via radare2 control-flow analysis after linear disassembly reading
+     * left real ambiguity (address 0xC0 appeared to be computed a second
+     * time, suggesting a loop rather than a one-shot block). Confirmed via
+     * basic-block graph: loop increments the counter by 9 (`add
+     * BYTE[rbp-1],0x9`), bounded by `<=0x13(19)`, starting at 0 on our
+     * path (Fw9366_cfg[2]!=0) -- exactly 3 iterations: i = 0, 9, 18.
+     * Fixed values used every iteration (computed once before the loop,
+     * NOT per-iteration): 0x2224 split into bitfield_hi=0x2224>>3=0x444
+     * and bitfield_lo=0x2224&7=4; separately, a fixed count variable
+     * (4) minus 1 = 3.
+     * Per iteration (3 registers, all live read-modify-write):
+     *   addr1 = 0xbf+i: v=sram_read; v=bits_set(v,12,0,0x444); sram_write
+     *   addr2 = 0xc0+i: v=sram_read; v=bits_set(v,5,3,4); v=bits_set(v,1,0,1); sram_write
+     *   addr3 = 0xc1+i: v=sram_read; v=bits_set(v,7,6,3); sram_write */
+    printf("-- fdt_mode_init: 3-iteration loop (0xbf/0xc0/0xc1 + i, i=0,9,18) --\n");
+    {
+        int offsets[3] = { 0, 9, 18 };
+        for (int k = 0; k < 3; k++) {
+            int i = offsets[k];
+            unsigned short v;
+            printf(" -- iteration i=%d --\n", i);
+            sram_read(h, (unsigned short)(0xbf + i), &v);
+            v = sram_bits_set(v, 12, 0, 0x444);
+            sram_write(h, (unsigned short)(0xbf + i), v);
+
+            sram_read(h, (unsigned short)(0xc0 + i), &v);
+            v = sram_bits_set(v, 5, 3, 4);
+            v = sram_bits_set(v, 1, 0, 1);
+            sram_write(h, (unsigned short)(0xc0 + i), v);
+
+            sram_read(h, (unsigned short)(0xc1 + i), &v);
+            v = sram_bits_set(v, 7, 6, 3);
+            sram_write(h, (unsigned short)(0xc1 + i), v);
+        }
+    }
+    printf("\n== NOTE: fdt_mode_init still has more body after this point (~15%% remaining) ==\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);
