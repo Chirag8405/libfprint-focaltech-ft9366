@@ -4078,3 +4078,50 @@ or an insufficiently-varied validation set.
 Disassemble and test `FtCalcSimScoreRefit` (offset 0xbb070) next -- it is the cheapest remaining real lead
 (already located, never examined) before considering this a closed question about the sensor/algorithm's
 viability.
+
+## Cheapest remaining leads checked: neither FtCalcSimScoreRefit nor FtVerifyByTemplate changes the conclusion (2026-09-17)
+
+Status: CONFIRMED via call-graph analysis (raw disassembly) and a data-driven simulation using the already-
+collected `varied_set` results. This closes out "option 1" from the previous entry before treating the
+separation failure as a settled viability question.
+
+### FtCalcSimScoreRefit (offset 0xbb070) is an alignment refinement step, not a different scoring mechanism
+Full call-graph check: its only non-logging call is `FtGetAffineTrans_32f` (the already-confirmed standard
+least-squares affine fit). It does NOT call `FtCalcSimScore` or any binarization/masking function. This means
+it almost certainly refines the ALIGNMENT (a fuller least-squares refit using more correspondences, analogous
+to what this project's own `estimate_rot_parms` second pass already does) for a LATER, separate call to
+`FtCalcSimScore` -- not an alternative scoring formula. Not worth pursuing further as a "different signal"
+lead.
+
+### FtVerifyByTemplate (offset 0xc7d40, 11512 bytes -- the largest function checked this entire project) IS a wrapper around FtVerifyTwoTemplate
+Call-graph check confirms it calls `FtVerifyTwoTemplate` directly (once), alongside `FtVerifySubTemplate` (2x),
+`FtSubTemplateCopy` (3x), `FtTemplate2TemplateMatch`, `FtVerifyFaByNegativeTemplate`, and `FtRansacNew` -- this
+is the enrolled-multi-subtemplate orchestration layer (managing several stored capture variants per enrolled
+finger and checking a probe against all of them, plus FAR/negative-template decision logic), built ON TOP OF
+the same `FtVerifyTwoTemplate`/`FtCalcSimScore` primitive already tested directly with real data. It is not a
+different comparison mechanism.
+
+### Simulated the one real, untested nuance: does "best-of-N enrolled subtemplates" rescue discrimination?
+Using the already-collected 190-pair real-score data, simulated `FtVerifyByTemplate`'s core strategy: for each
+of the 10 index-finger captures as a "probe," take the BEST score among the other 9 index captures (simulating
+9 enrolled same-finger sub-templates) versus the BEST score among all 10 different-finger captures (simulating
+an impostor's best attempt against the same enrollment):
+```
+same-finger best-of-9:   0.889 0.945 0.970 0.980 0.987 0.987 0.981 0.971 0.914 0.927  (mean 0.9549)
+diff-finger best-of-10:  0.857 0.914 0.965 0.985 0.989 0.989 0.988 0.975 0.899 0.910  (mean 0.9472)
+```
+The genuine probe's best-of-9 same-finger score exceeds the impostor's best-of-10 different-finger score in
+only **5 of 10 cases** -- a coin flip. The mean gap (0.9549 vs 0.9472 = 0.0077) is negligible. **Multi-
+subtemplate "best of N" selection does not rescue discrimination** -- it does not change the conclusion.
+
+### Conclusion: both cheap remaining leads exhausted, conclusion stands
+Neither of the two previously-unexamined real vendor functions changes the finding. Per the pre-registered
+decision rule, this is now a serious, well-evidenced viability question, not a bug to keep chasing:
+**this project has not found a way, using any real vendor function or verification mode located in this `.so`,
+to reliably separate same-finger from different-finger captures on this sensor** -- despite independently
+validating detection (ground-truth rotation-repeatability matching the real algorithm), descriptor computation
+(24/256 avg Hamming on tight matches), alignment estimation (validated against real ground truth), and now the
+scoring formula itself (tested with 100% real vendor code across 190 pairs from a genuinely varied real
+dataset). Remaining honest options (per the previous entry): multi-frame fusion (no evidence this sensor's
+firmware supports it, not yet investigated) or accepting this as a genuine viability limit of this sensor/
+algorithm-family combination as currently understood.
