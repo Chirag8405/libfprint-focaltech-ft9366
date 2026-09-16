@@ -710,7 +710,14 @@ int main(void)
             sram_write(h, (unsigned short)(0xc1 + i), v);
         }
     }
-    printf("\n== NOTE: fdt_mode_init still has more body after this point (~15%% remaining) ==\n");
+    /* --- fdt_mode_init FINAL SECTION (0x158080-0x158223) --- function ends
+     * here; this completes fdt_mode_init 100%. */
+    printf("-- fdt_mode_init: sram_write(0x1a8a, 0xff) --\n");
+    sram_write(h, 0x1a8a, 0xff);
+    printf("-- fdt_mode_init: intflag_mask(3) --\n");
+    intflag_mask(h, 3);
+    printf("-- [fdt_mode_init: REG9366[0x78]=1 -- host-side only, no wire effect] --\n");
+    printf("\n== fdt_mode_init COMPLETE -- fully traced, 100%% ==\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);

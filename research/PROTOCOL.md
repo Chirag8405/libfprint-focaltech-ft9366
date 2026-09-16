@@ -912,3 +912,35 @@ matters: a purely linear read would very likely have either mis-treated the repe
 computation as a copy-paste artifact (silently dropping 6 of the 9 real writes) or guessed at a wrong loop
 bound. Installing a decompiler-adjacent tool (radare2) once linear reading hit genuine ambiguity, rather than
 guessing, resolved it with certainty.
+
+## MILESTONE: fw9366_fdt_mode_init FULLY TRACED AND TESTED CLEAN, 100% (2026-09-16)
+
+Status: CONFIRMED, complete function, all live hardware transfers clean, zero timeouts
+
+Final section (0x158080-0x158223, function end):
+```
+sram_write(0x1a8a, sram_bits_set(0, hi=7,lo=0, new=0xff)) = sram_write(0x1a8a, 0x00ff)
+intflag_mask(3)
+REG9366[0x78] = 1   -- host-side only, no wire effect
+```
+
+Live test: `sram_write(0x1a8a, 0xff)` clean. `intflag_mask(3)` read back `0x1a83=0x0060` (the accumulated mask
+from `img_mode_init`'s earlier `intflag_mask(5)`/`intflag_mask(6)` calls, `0x20|0x40`, within this same run)
+and wrote `0x0068` (`0x60 | FW9366_INT_INDEX[3]=0x08`) -- another confirmed cross-function consistency check,
+not just an isolated clean transfer.
+
+**`fw9366_fdt_mode_init` is now completely and correctly traced end to end.** Combined with the already-complete
+`fw9366_img_mode_init`, the two largest functions in the `fw9366_init_chip` -> `Update_Base` ->
+`fdt_base_Stable_Update` -> `fdt_AutoSDacUpdate`/`fdt_manual_start` call path are now fully resolved and tested.
+
+### Running summary of fully-complete functions this session
+- `fw9366_idle_enter` -- 100%
+- `fw9366_img_mode_init(0)` -- 100%
+- `fw9366_fdt_mode_init` (invocation A1 path) -- 100%
+
+### Next concrete action
+Return to `fw9366_fdt_AutoSDacUpdate`'s own remaining body (the DAC-feedback arithmetic that surrounds its
+calls to `fdt_manual_start`/`fdt_get_a_frame_data`, not yet traced) -- OR proceed directly to
+`fw9366_fdt_get_a_frame_data` (called next in `fdt_base_Stable_Update`'s sequence after `fdt_manual_start`
+returns) per the original call order. `fdt_get_a_frame_data` is the next untraced function in the direct
+outer sequence.
