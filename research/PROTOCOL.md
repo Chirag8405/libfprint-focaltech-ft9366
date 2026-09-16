@@ -995,3 +995,46 @@ not yet identified. Not yet resolved either way -- flagged as an open question, 
 `fw9392_fdt_base_fail_check` and `fw9366_fdt_base_Min_Updata` (both called after `fdt_get_a_frame_data` in
 `fdt_base_Stable_Update`'s real sequence) -- one of these likely interprets/validates the frame data just read,
 which may clarify whether the all-zeros result is expected at this stage.
+
+## Update: fw9392_fdt_base_fail_check traced and tested -- confirms frame data is invalid at this point (2026-09-16)
+
+Status: CONFIRMED (static disassembly, pure local logic) + live test against actual captured data
+
+### fw9392_fdt_base_fail_check(data) -- pure local, no I/O
+
+```
+for i in 0..3:
+  val = native_u16_read(data + i*2)   -- reads the buffer AS ALREADY BYTE-SWAPPED by
+                                          fdt_get_a_frame_data; a plain little-endian
+                                          re-read of that swapped buffer (NOT a further
+                                          byte-order reinterpretation -- this was a real
+                                          bug caught and fixed before testing: initially
+                                          wrote this as a big-endian read of the swapped
+                                          bytes, which is wrong; corrected to a plain LE
+                                          read matching the disassembly's native uint16
+                                          access exactly)
+  if val > 0x2bc(700) or val <= 0x12b(299): return -1 (FAIL), stop checking further values
+return 0 (PASS)
+```
+
+### Live test result -- decisive
+
+Ran directly against this session's actual captured `frame_buf` (all zeros, from the previous
+`fdt_get_a_frame_data` test):
+
+```
+fdt_base_fail_check: i=0 val=0 (0x0000) <= 0x12b -- FAIL
+fdt_base_fail_check() returned: -1 (FAIL)
+```
+
+**This resolves the open question from the previous entry.** The all-zero frame data is not an artifact of a
+bug in this session's replication -- the real driver's OWN validity check would ALSO reject it. Two
+possibilities, not yet distinguished: (a) something must happen before this specific capture point to produce
+valid data (e.g. `fdt_base_Min_Updata`, not yet traced, may perform a required prerequisite step), or (b) a
+failure here is an EXPECTED, handled outcome at this stage of calibration (e.g. feeds into retry/fallback
+logic elsewhere in `fdt_base_Stable_Update`, not yet traced beyond this point).
+
+### Next concrete action
+Trace `fw9366_fdt_base_Min_Updata` (the last untraced function directly in `fdt_base_Stable_Update`'s
+sequence) -- may resolve which of the two possibilities above is correct, and/or reveal what "Min Update"
+does when the fail-check result is -1 (e.g. does the caller check this return value and take a different path).

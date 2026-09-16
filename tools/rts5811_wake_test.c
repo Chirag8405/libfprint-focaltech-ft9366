@@ -231,6 +231,30 @@ static int fdt_get_a_frame_data(libusb_device_handle *h, unsigned char *out_buf)
     return 0;
 }
 
+/* fw9392_fdt_base_fail_check(data), traced at 0x155d26: pure local, no I/O.
+ * The real function reads each entry as a native (little-endian x86)
+ * uint16 from the buffer produced by fdt_get_a_frame_data -- which already
+ * has the byte-swap applied. So here we must also do a plain little-endian
+ * read of that same already-swapped buffer, not reinterpret the byte
+ * order again. Valid range is 299 < val <= 0x2bc(700). Returns -1 (fail)
+ * immediately on the first out-of-range value, else 0 after checking all 4. */
+static int fdt_base_fail_check(const unsigned char *swapped_buf)
+{
+    for (int i = 0; i < 4; i++) {
+        unsigned short val = (unsigned short)(swapped_buf[i * 2] | (swapped_buf[i * 2 + 1] << 8));
+        if (val > 0x2bc) {
+            printf("  fdt_base_fail_check: i=%d val=%u (0x%04x) > 0x2bc -- FAIL\n", i, val, val);
+            return -1;
+        }
+        if (val <= 0x12b) {
+            printf("  fdt_base_fail_check: i=%d val=%u (0x%04x) <= 0x12b -- FAIL\n", i, val, val);
+            return -1;
+        }
+        printf("  fdt_base_fail_check: i=%d val=%u (0x%04x) -- OK\n", i, val, val);
+    }
+    return 0;
+}
+
 /* FW9366_WorkMode_Cmd table, extracted directly from .rodata at 0x1c88c0
  * (3 bytes per mode, modes 0-11). Mode 11 sends only 1 byte; all others
  * send all 3. */
@@ -779,6 +803,15 @@ int main(void)
     unsigned char frame_buf[8] = { 0 };
     fdt_get_a_frame_data(h, frame_buf);
     hexdump("  frame_buf after byte-swap", frame_buf, sizeof(frame_buf));
+
+    /* --- fw9392_fdt_base_fail_check() -- pure local, no I/O, fully traced.
+     * Tested here directly against the real frame_buf just captured above
+     * -- a decisive test of whether that all-zero capture is usable
+     * calibration data or not, using the real driver's own validity logic. */
+    printf("\n== fw9392_fdt_base_fail_check() against the captured frame_buf ==\n");
+    int fail_result = fdt_base_fail_check(frame_buf);
+    printf("  fdt_base_fail_check() returned: %d (%s)\n", fail_result,
+           fail_result == 0 ? "PASS" : "FAIL");
 
     libusb_release_interface(h, 0);
     libusb_close(h);
