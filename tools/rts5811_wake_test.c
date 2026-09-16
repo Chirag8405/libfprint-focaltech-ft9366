@@ -139,6 +139,47 @@ static int sfr_read(libusb_device_handle *h, unsigned char reg, unsigned char *o
     return 0;
 }
 
+/* FW9366_INT_INDEX table, extracted from .rodata at 0x1c6000: bit-flag
+ * table, entry[i] = 1<<i (only indices 0-10 needed so far). */
+static const unsigned short FW9366_INT_INDEX[11] = {
+    0x0001, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0080, 0x0100, 0x0200, 0x0400,
+};
+
+/* fw9366_intflag_mask(src), traced at 0x1549e1: sram_read(0x1a83) | mask,
+ * sram_write(0x1a83, result). mask = FW9366_INT_INDEX[src]. */
+static int intflag_mask(libusb_device_handle *h, int src)
+{
+    unsigned short v = 0;
+    sram_read(h, 0x1a83, &v);
+    v = (unsigned short)(v | FW9366_INT_INDEX[src]);
+    return sram_write(h, 0x1a83, v);
+}
+
+/* fw9366_int_gap_set(gap), traced at 0x154b50: gap clamped to <=0x68, then
+ * sfr_write(0x8e, (gap*10000)>>12). */
+static int int_gap_set(libusb_device_handle *h, unsigned char gap)
+{
+    if (gap > 0x68) gap = 0x68;
+    int computed = ((int)gap * 10000) >> 12;
+    return sfr_write(h, 0x8e, (unsigned char)computed);
+}
+
+/* fw9366_wdtcnt_int_en(en), traced at 0x154ba7: sfr_write(0x90, en?1:0). */
+static int wdtcnt_int_en(libusb_device_handle *h, int en)
+{
+    return sfr_write(h, 0x90, en ? 1 : 0);
+}
+
+/* fw9366_wdtcnt_gap_set(val), traced at 0x154bdd. */
+static int wdtcnt_gap_set(libusb_device_handle *h, unsigned short val)
+{
+    wdtcnt_int_en(h, 0);
+    sfr_write(h, 0x91, (unsigned char)((val >> 8) & 0xff));
+    sfr_write(h, 0x92, (unsigned char)(val & 0xff));
+    wdtcnt_int_en(h, 1);
+    return 0;
+}
+
 /* FW9366_WorkMode_Cmd table, extracted directly from .rodata at 0x1c88c0
  * (3 bytes per mode, modes 0-11). Mode 11 sends only 1 byte; all others
  * send all 3. */
@@ -495,7 +536,47 @@ int main(void)
     set_scan_rate_2m(h);
     printf("-- img_mode_init(0): sram_write(0x1807, 0x18e1) --\n");
     sram_write(h, 0x1807, 0x18e1);
-    printf("-- [REST OF img_mode_init(0) NOT YET TRACED -- ~75%% remaining] --\n\n");
+
+    /* --- img_mode_init(0) CONTINUED to completion (0x15c02a-0x15c4aa) ---
+     *   sram_write(0x1887, sram_bits_set(0, hi=2,lo=0,new=2))   -- since
+     *       Fw9366_cfg[2]!=0 (confirmed always true) = sram_write(0x1887, 2)
+     *   if (REG9366[0x77] != 1): [TRUE, since REG9366[0x77]=0 confirmed]
+     *     v = sram_read(0x1805); v = bits_set(v,4,0,0); v = bits_set(v,7,5,0);
+     *     sram_write(0x1805, v)   -- clears the low byte, live read-modify-write
+     *   v = sram_read(0x1811); v = bits_set(v,9,0,0x1fe); sram_write(0x1811, v)
+     *       -- live read-modify-write
+     *   intflag_mask(5); intflag_mask(6)
+     *   REG9366[0x77] = 1   -- host-side only, no wire effect (flips the
+     *       guard that gated THIS call; irrelevant to the current invocation)
+     *   int_gap_set(0x64)
+     *   wdtcnt_gap_set(0x7d0)
+     * This is the END of img_mode_init(0) -- function fully traced, 100%. */
+    printf("-- img_mode_init(0): sram_write(0x1887, 2) --\n");
+    sram_write(h, 0x1887, 2);
+    printf("-- img_mode_init(0): 0x1805 live read-modify-write (clear low byte) --\n");
+    {
+        unsigned short v = 0;
+        sram_read(h, 0x1805, &v);
+        v = sram_bits_set(v, 4, 0, 0);
+        v = sram_bits_set(v, 7, 5, 0);
+        sram_write(h, 0x1805, v);
+    }
+    printf("-- img_mode_init(0): 0x1811 live read-modify-write --\n");
+    {
+        unsigned short v = 0;
+        sram_read(h, 0x1811, &v);
+        v = sram_bits_set(v, 9, 0, 0x1fe);
+        sram_write(h, 0x1811, v);
+    }
+    printf("-- img_mode_init(0): intflag_mask(5) --\n");
+    intflag_mask(h, 5);
+    printf("-- img_mode_init(0): intflag_mask(6) --\n");
+    intflag_mask(h, 6);
+    printf("-- img_mode_init(0): int_gap_set(0x64) --\n");
+    int_gap_set(h, 0x64);
+    printf("-- img_mode_init(0): wdtcnt_gap_set(0x7d0) --\n");
+    wdtcnt_gap_set(h, 0x7d0);
+    printf("-- [img_mode_init(0) COMPLETE -- fully traced, 100%%] --\n\n");
 
     printf("-- sram_write(0x1801, 0xfc9b) --\n");
     sram_write(h, 0x1801, 0xfc9b);
