@@ -1679,3 +1679,54 @@ the only approach already proven to work at this sensor's actual resolution. Sco
 real multi-day sub-project, not a quick fix. Starting with symbol enumeration and call-graph mapping in
 `~/focaltech-ft9366-arch-shim/libfprint-2.so.2.0.0` before any linear tracing, per this session's standing
 methodology.
+
+### Major finding: the proprietary .so has full DWARF debug info, not stripped (2026-09-16)
+`~/focaltech-ft9366-arch-shim/libfprint-2.so.2.0.0` retains full DWARF (`.debug_info`, `.debug_line`, etc.) --
+real source file names (`FtAlg.c`, `FpSensorLib.c`), line numbers, and complete struct/function type
+signatures, not just addresses. `gdb ptype /o` and `pahole` can pull exact struct layouts straight out of it.
+This substantially changes the scope/risk of reverse-engineering the vendor matcher: it's closer to reading
+labeled source than blind disassembly.
+
+Confirmed via DWARF (not yet independently verified against real captures):
+```c
+typedef struct ST_FocalTemplate {           // 520 bytes total
+    ST_Feature *pTemplateFeature;           // offset 0
+    UINT8 *templateBinDiscr;                // offset 8
+    UINT8 *templatePixValid;                // offset 16
+    UINT32 headerSize, featBufSize, binBufSize, maskBufSize, templateSize, templateBinDiscrLen; // 24-47
+    UINT16 templateExtendArea, subtemplatesPairIndex;   // 48-51
+    FP32 subtemplatePairHmatrix[10];                    // 52-91
+    ST_FocalSimpleHmatrix templateCoinHmatrix[96];       // 92-475 (384 bytes, member type not yet pulled)
+    UINT8 nFeatureNum[2], templatePartsNum, templateArea, templateQuality,
+          templateCondition, templateContrast, tempReplaceFlg,
+          keepByte2..5, templateCoinFlag[25];            // 476-512
+} ST_FocalTemplate;
+
+typedef struct ST_Feature {    // 44 bytes -- a keypoint + BINARY DESCRIPTOR, not a classic ridge minutia
+    FP32 x, y, ori;
+    UINT32 bDescri[8];         // 256-bit binary descriptor (BRIEF/ORB-style), not just position+angle
+} ST_Feature;
+
+typedef struct ST_FocalSensorImageInfo {   // 5 bytes
+    UINT8 quality, area, cond, contrast, reser;
+} ST_FocalSensorImageInfo;
+
+int    FtGetTemplate(UINT8 *image, ST_FocalTemplate *out_template, ST_FocalSensorImageInfo *info);
+UINT16 FtVerifyTwoTemplate(ST_FocalTemplate *t1, ST_FocalTemplate *t2, FP32 *score_out, UINT8, UINT8);
+SINT16 FtVerifyByTemplate(ST_FocalTemplate *, SINT16 *, SINT16 *, FP32 *, UINT8);
+```
+
+**This likely explains why the vendor's approach works at this sensor's tiny 64x80 resolution where stock
+MINDTCT does not**: `ST_Feature` carries a 256-bit binary descriptor per keypoint (computer-vision-style
+local descriptor matching, e.g. BRIEF/ORB-like), not just x/y/ridge-angle -- far more discriminating
+information per keypoint than classic minutiae, so it needs far fewer keypoints to get a reliable match.
+
+### Strategy fork: direct-offset-call the real .so functions vs. faithful reimplementation
+`FtGetTemplate`/`FtVerifyTwoTemplate`/`FtVerifyByTemplate` are LOCAL symbols (confirmed via `readelf -s`: `FUNC
+LOCAL`, not in `.dynsym`) -- not resolvable via plain `dlsym()`, but still callable in-process via a computed
+address (`dlopen()` base + known file offset, cast to a function pointer), since the code is present and
+loaded either way.
+
+**This directly conflicts with this project's original goal, stated at the very start of the session: "zero
+runtime dependency on any proprietary binary."** Not proceeding with direct-offset-calling as the shipped
+architecture without checking with the user first. Flagged as a fork rather than assumed.
