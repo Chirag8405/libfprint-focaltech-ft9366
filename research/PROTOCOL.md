@@ -1846,3 +1846,32 @@ Internal logic of the four callees above is not yet traced (next). No live/inter
 against the real .so yet -- deferred until enough of the pipeline is reimplemented to compare a real
 end-to-end intermediate buffer (per Step 1's own validation methodology: dump intermediate buffers from the
 real .so via gdb for the same input image, diff against our reimplementation).
+
+## Finding: shared primitives are OpenCV-equivalent standard operations, not bespoke (2026-09-16)
+
+Status: CONFIRMED for FtImgBorderInterpolate (exact signature/behavior match); FtImgBoxFilter/FtImgGaussianblur/
+curved_surface_img_normalize_32f_2_8u confirmed by strong structural correspondence, not yet bit-exact-verified
+against real OpenCV output.
+
+`FtImgBorderInterpolate(SINT32 p, SINT32 len, SINT32 borderType)` is a byte-for-byte structural match to
+OpenCV's public `cv::borderInterpolate(int p, int len, int borderType)` (same signature shape, same borderType
+constant space: 0=CONSTANT, 1=REPLICATE, 2=REFLECT, 3=WRAP, 4=REFLECT_101). `FtImgBoxFilter` calls it with
+`borderType=4` = `BORDER_REFLECT_101`, OpenCV's own default. `FtImgBoxFilter` itself uses the classic separable
+running-sum box-filter algorithm (row-sum pass, then column-sum pass, single normalize-by-`ksize^2` division at
+the end when `normalize=1`) -- textbook `cv::boxFilter(src, dst, CV_32F, Size(ksize,ksize), normalize=true,
+BORDER_REFLECT_101)` semantics, not a bespoke algorithm.
+
+**Practical implication for reimplementation**: `FtImgBoxFilter`, `FtImgGaussianblur` (almost certainly
+`cv::GaussianBlur` with OpenCV's standard auto-sigma formula when sigma<=0, given identical calling
+convention), and `curved_surface_img_normalize_32f_2_8u` (matches `cv::normalize(..., NORM_MINMAX, CV_8U)`)
+can be reimplemented directly against **public, well-documented OpenCV semantics** rather than needing
+bit-level RE of internal loop structure -- box filter and Gaussian blur are exact, well-specified operations
+where any correct implementation matching kernel size/normalization/border-mode produces identical output, not
+an approximation requiring the original's specific optimization (running-sum vs. naive) to be replicated.
+This meaningfully narrows the genuinely-bespoke surface area needing full from-scratch RE down to:
+`curved_surface_img_localequalizehist_v2` (mask-aware local histogram equalization -- not a stock OpenCV call,
+since OpenCV's CLAHE has no mask parameter), the segmentation/resize/SPA-smoothing stages not yet traced, and
+the two large SIFT-like/binary-descriptor stages.
+
+Not yet done: bit-exact validation of this hypothesis against real captured data (deferred, per plan, until
+enough of the pipeline is reimplemented to diff a real intermediate buffer via gdb).
