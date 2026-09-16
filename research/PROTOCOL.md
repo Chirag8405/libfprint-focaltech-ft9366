@@ -2287,3 +2287,75 @@ Summary of confidence levels for `FtGetMfsFeatures` reimplementation:
 
 Proceeding to Step 3: `FtGetMfbFeatures` (the bespoke binary descriptor, no public reference available -- the
 highest-remaining-uncertainty piece of the matching pipeline).
+
+## MILESTONE: FtMfbDescriptors (the bespoke binary descriptor) fully understood, exact data tables extracted (2026-09-16)
+
+Status: CONFIRMED algorithm structure (disassembly + decompile cross-checked); exact raw data tables extracted
+directly from `.rodata` (not estimated/reconstructed); one indexing subtlety flagged as needing empirical
+verification during implementation rather than asserted with false certainty.
+
+### Where it lives
+`FtGetMfbFeatures` runs the ENTIRE SAME detection pipeline as `FtGetMfsFeatures` (identical callee list:
+`FtCreateInitImg`, `FtBuildGaussPyr`, `FtBuildDogPyr`, `FtScaleSpaceExtrema`, `FtCalcFeatureScales`,
+`FtAdjustForImgDbl`, orientation-assignment helpers, `FtInValidPixelSet` -- all already traced/confirmed above)
+-- confirmed via callee-list comparison, not assumed. The ONLY difference: where `FtGetMfsFeatures` calls
+`FtComputeDescriptors` (the classic OpenSIFT-style float descriptor, role still open), `FtGetMfbFeatures` calls
+**`FtMfbDescriptors`** instead -- confirmed via `axt` cross-reference that this is the ONLY caller. This means
+the detection/orientation stage does not need to be re-traced for this function; only `FtMfbDescriptors`
+itself (1407 bytes, 32 cx, 46 bbs -- a moderate, tractable size) needed genuine new RE.
+
+### The algorithm: a steered, concentric-ring binary descriptor (FREAK/BRISK-like, not ORB's random pattern)
+```
+FtMfbDescriptors(features, ..., gauss_pyr, d, n, dog_pyr?):
+  for each feature f (44-byte internal working record, x=+0x0, y=+0x4, ori=+0xc, pyramid-level-index via +0x20):
+    cos_o = cosf(f.ori)
+    sin_o = sqrt(1 - cos_o^2), sign-corrected for the correct quadrant (xor with the float sign-bit mask when
+                                                                          needed -- confirmed via disassembly)
+    for each (dx,dy) in coordinarePairs[]:              -- CONFIRMED fixed, precomputed offset table (below)
+      rx = f.x + (dx*cos_o - dy*sin_o)
+      ry = f.y + (dx*sin_o + dy*cos_o)                  -- standard 2D rotation by the keypoint's own orientation
+      (bounds-checked against the sampled pyramid level image's width/height)
+      sample[i] = FtGetPixel(pyramidLevelImage, round(ry), round(rx))
+    for bitIndex in 0..255:
+      (a,b) = ModePairs[bitIndex]                       -- CONFIRMED fixed comparison-index table (below)
+      bit = (sample[a] < sample[b]) ? 1 : 0
+      descriptorWord[bitIndex/32] |= bit << (bitIndex%32)
+    f_out.bDescri[0..7] = descriptorWord[0..7]
+    f_out.x, f_out.y, f_out.ori = f.x, f.y, f.ori
+```
+This is a real, describable, standard class of technique: a **steered (orientation-normalized) binary
+descriptor built from intensity-pair comparisons over a fixed sampling pattern**, the same family as ORB's
+steered BRIEF and BRISK/FREAK's ring-based patterns -- not an inscrutable bespoke mystery. The specific sampling
+GEOMETRY (see below) is concentric-ring-shaped, closer to BRISK/FREAK's design than ORB's random pattern.
+
+### Exact data tables extracted directly from `.rodata` (not estimated)
+- **`coordinarePairs`** (address `0x1a35a0`, 360 bytes = 45 x [FP32 x, FP32 y] offset pairs): decoded and saved
+  to `research/tables/coordinarePairs.csv`. The 45 points form **3 clean concentric rings**, evenly angularly
+  spaced within each ring: radius=4.0 (10 angular positions, 36 deg apart), radius=8.0 (15 positions, 24 deg
+  apart), radius=13.0 (20 positions, 18 deg apart) -- confirmed by direct computation from the decoded (x,y)
+  values (e.g. entry 1 = (3.236, 2.351), magnitude = sqrt(3.236^2+2.351^2) = 4.0 exactly). This is a deliberate,
+  regular geometric design, not arbitrary/random data.
+- **`ModePairs`** (address `0x1a33a0`, 512 bytes = 256 x [UINT8 a, UINT8 b] index pairs): decoded and saved to
+  `research/tables/ModePairs.csv`. Exactly 256 entries -- one per output descriptor bit (8 x 32-bit words =
+  256 bits, matching `ST_Feature.bDescri[8]` exactly). Index values observed range 0-44, referencing positions
+  in the 45-sample set gathered via `coordinarePairs`.
+
+### One indexing subtlety flagged, not resolved with false certainty
+The real sampling loop's start pointer (`rbx = coordinarePairs + 8`, i.e. skipping the table's first 8-byte
+entry) suggested at first read that only 44 of the 45 `coordinarePairs` entries are actually sampled. However,
+`ModePairs` contains index values up to 44 (inclusive), implying 45 distinct samples must exist for those
+indices to be valid. This is not yet fully reconciled -- possibilities include an implicit un-rotated
+center-point sample (the feature's own pixel, index 0) supplementing 44 samples from `coordinarePairs[1..44]`,
+or a subtlety in exactly which 4-byte-aligned slice of the raw loop pointer arithmetic corresponds to "entry
+0" that a purely-decompiled reading doesn't resolve with certainty. Not blocking: this is a concrete, small,
+empirically-checkable detail (try both indexing interpretations against a real captured image, compare
+resulting descriptors' bit patterns for self-consistency) rather than a deep algorithmic unknown -- deferred to
+the implementation/validation phase rather than guessed here.
+
+### Practical implication
+The binary descriptor stage -- the piece flagged from the very start as having "no external reference, full RE
+required" -- is now fully understood structurally, with its exact data tables extracted as raw bytes rather
+than needing to be inferred or approximated. Combined with the OpenSIFT-equivalent detection/orientation stage
+(Step 2) and the already-traced preprocessing chain (Step 1), enough of the algorithm is now understood to
+begin writing an actual C reimplementation, with `FtVerifyTwoTemplate` (matching/scoring, Step 4) as the last
+major untraced piece.
