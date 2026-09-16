@@ -2851,3 +2851,39 @@ is likely NOT purely geometric (pyramid size/scale) -- it could be in keypoint l
 orientation/descriptor computation itself, or the matching stage's fundamental approach. Continuing to attempt
 completion of the full `FtGetTemplate` ground-truth dump (blocked on the `pData1`/`pData2` internal-buffer
 crash, previous entry) is the most direct remaining path to find it, rather than further isolated guesses.
+
+## MILESTONE: real FtGetMfbFeatures ground truth successfully extracted (2026-09-16)
+
+Status: CONFIRMED, real output from the actual proprietary algorithm (diagnostic-only, per this session's
+explicit decision). Pivoted from calling `FtGetTemplate` (blocked on a deep chain of session/device-init state
+dependencies -- `FtGetFlag`, `pData1`/`pData2`, see previous entries) to calling **`FtGetMfbFeatures` directly**
+with a manually-constructed `ST_IplImage` (96x96, our real capture centered zero-padded per the confirmed
+canvas-geometry finding) and `ST_InputForTemplate` (using the CONFIRMED real constants: intvls=3, sigma=1.6,
+contrThr=0.02, curvThr=15, imgDbl=1; other fields -- octave=4, validArea=100, sensorCol=96, imgScale=1.5 --
+are reasoned guesses, not independently confirmed, and validFlg/badPixselValidFlg were set to all-valid masks
+to avoid a null-deref crash while not injecting unconfirmed segmentation data). This call succeeded cleanly,
+no crash, on every real capture tried (`tools/ground_truth_dump2.c`).
+
+### Striking finding: every capture produces EXACTLY 160 total features
+```
+same1.raw: nMax=90 nMin=70  (total 160)
+same5.raw: nMax=93 nMin=67  (total 160)
+same6.raw: nMax=90 nMin=70  (total 160)
+diff1.raw: nMax=95 nMin=65  (total 160)
+```
+Every single test capture sums to EXACTLY `gSensorInfor.maxKpNum` (160), not an organically-varying count based
+on true image content. This strongly suggests the real algorithm is designed to always return exactly
+`maxKpNum` features by construction (e.g. selecting the top-160 candidates by some strength/quality ranking,
+or an explicit fill-to-quota mechanism), NOT a natural DoG-extrema count that varies freely with image
+content. **This session's `focal_sift.c` reimplementation instead returns a naturally-varying count (37-65
+across the same dataset) with no such quota mechanism at all** -- a concrete, structural difference from the
+real algorithm, independent of whether the exact "160" figure here is itself influenced by this diagnostic
+harness's guessed `validArea`/`octave` parameters (flagged honestly as unconfirmed).
+
+Real dumped feature data (position, orientation, 256-bit descriptor) saved to
+`research/ground_truth/` for direct comparison against the reimplementation's own output on the same images.
+
+### Next
+Diff this real ground truth against `focal_sift.c`'s output on the same images (keypoint positions/counts,
+then descriptor agreement for any positionally-matching keypoints) to precisely localize the reimplementation's
+remaining divergence, per this continuation's original Step 2-3 plan.
