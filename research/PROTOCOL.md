@@ -3020,3 +3020,52 @@ whole-row comparison) found no clean match despite the underlying pyramid being 
 Implement bicubic interpolation for the img_dbl upscale (the most likely, most standard candidate) and re-run
 this same row-level comparison to check whether it closes the remaining sub-pixel gap, before re-testing the
 single-keypoint descriptor match.
+
+## MAJOR FIX CONFIRMED: two real descriptor bugs found and fixed via ground-truth sample diffing (2026-09-16)
+
+Status: CONFIRMED decisively against real ground truth. This is the resolution Step 1-4 (this continuation)
+was aiming for.
+
+### Method: reproduced the real keypoint's 45 raw samples directly, diffed value-by-value
+Using the known real keypoint (`same5.raw` feat1 index 0: `x=76.935547, y=86.108253, ori=1.596882`) and its
+real 45-sample array (`research/ground_truth/same5_feat0_real_samples.txt`), computed our own sampling stage
+in isolation (no bit-comparison) at octave=1 (the "natural home" scale, where local coordinates equal the
+final x,y exactly since `FOCAL_DBL_SCALE/2^1 = 1.0`).
+
+**First diff result: samples diverged substantially (sum-sq-error ~1,052,610 across 45 values)** -- localizing
+the bug to sampling, not bit-comparison, per Step 3's own decision tree. Inspecting the pattern showed
+corresponding "ring" peaks appearing roughly opposite each other between mine and real (e.g. my ring-1 peak
+near index 3-4, real's near index 8-9 -- roughly half the ring apart), suggesting a rotation-phase error rather
+than a scale/position error.
+
+### Fix 1 (CONFIRMED): steered sampling needs `ori + PI`, not `ori` directly
+Tested negating both `cos_o` and `sin_o` (equivalent to rotating by `ori+PI`) with the same real inputs:
+**sum-sq-error dropped ~10x, to ~94,447**. This is a decisive, mechanistically real fix, not noise -- applied
+to `compute_binary_descriptor` in `focal_sift.c`.
+
+### Fix 2 (CONFIRMED): comparison direction is `sample[a] > sample[b]`, not `<`
+Even after Fix 1, the FINAL DESCRIPTOR (not just raw samples) was still wrong: Hamming distance 225/256 against
+the real descriptor for this exact keypoint -- but **225 is suspiciously close to 256, i.e. the bitwise
+complement of a GOOD match** (256-225=31). Flipping the `ModePairs` comparison from `samples[a] < samples[b]`
+to `samples[a] > samples[b]` gave **Hamming distance 29/256** -- a clear, decisive, correct match (first 32
+bits: `23f377ff` == `23f377ff` EXACTLY). Applied to `focal_sift.c`.
+
+### Precise localization achieved, per Step 3's own decision tree
+Per this continuation's own instructions: "if sampling diverges, check coordinatePairs/interpolation/pyramid
+level" (Fix 1, confirmed: it was a rotation-phase error, not those) then "if sampling matches but final
+descriptors still diverge: check ModePairs comparison operator" (Fix 2, confirmed exactly this). Both
+predictions in the decision tree were validated by the actual data.
+
+### Honest caveat: the full pipeline (own detection + own orientation) still shows a gap not yet resolved
+The single-keypoint isolated test (feeding the REAL x,y,ori,octave=1 directly) is unambiguous: 29/256. But
+running the FULL reimplementation pipeline (`focal_extract_features`, using OUR OWN detected position AND
+orientation, not the oracle real values) on the same image and diffing against ground truth still shows high
+average Hamming (~142/256) even restricted to keypoints where OUR position agrees to <1px and OUR orientation
+agrees to real's within <0.02 rad. This did not improve much from before the two fixes (was ~114-145 depending
+on exact filter). This suggests a REMAINING, separate issue -- most likely that our own keypoints' ASSIGNED
+octave/interval (used to select which `gauss_pyr` level to sample from) doesn't always match what the real
+algorithm would assign for the same physical keypoint, even when x/y/ori all agree closely; this was not
+independently verified this session (the isolated test manually forced octave=1, sidestepping this question).
+Not yet resolved -- flagged plainly rather than claimed fixed, per this session's own rules. Both fixes are
+kept (they are independently proven correct against real data), and this remaining gap is the next thing to
+investigate if the full 45-pair test below doesn't show clean separation.

@@ -39,11 +39,19 @@
 /* CONFIRMED via real .so ground truth (research/PROTOCOL.md, "MAJOR
  * GROUND-TRUTH FINDING"): the real algorithm's working canvas is a FIXED
  * 96x96 (gSensorInfor.sensorCols/sensorRows), NOT this sensor's native
- * 64x80 wire resolution, and the "doubled" scale factor is 1.5x (96->144,
- * verified via both live struct inspection and disassembly arithmetic:
- * round(dim*3/2)), NOT OpenSIFT's stock 2x. */
+ * 64x80 wire resolution. (The doubled-scale factor is covered by the
+ * comment on FOCAL_DBL_SCALE just below -- see that for the corrected
+ * 2.0x finding.) */
 #define FOCAL_WORKING_CANVAS 96
-#define FOCAL_DBL_SCALE 1.5
+/* CORRECTED (this continuation session): direct inspection of the real
+ * FtMfbDescriptors's actual gauss_pyr[0][0] via gdb shows a REAL 192x192
+ * float image (depth=32) -- exactly 96*2, standard OpenSIFT-stock 2x
+ * doubling, NOT 1.5x. The earlier "1.5x" finding (imgSizeScale=144x144
+ * inside FtGetTemplate) was real but misapplied here -- it belongs to a
+ * DIFFERENT FtGetTemplate-internal stage (not yet identified), not this
+ * SIFT-like detection pyramid's img_dbl step. Also confirmed 4 real
+ * octaves (192/96/48/24), not 3. */
+#define FOCAL_DBL_SCALE 2.0
 
 /* ---- OpenSIFT stock constants not confirmed to be overridden ---- */
 #define SIFT_INIT_SIGMA        0.5
@@ -113,28 +121,40 @@ static void gaussian_blur_f(FImage *im, double sigma)
     free(kernel);
 }
 
-/* Bilinear resize (used for image doubling, imgDbl=1). */
-static FImage *resize_bilinear(const FImage *src, int newRows, int newCols)
+/* OpenCV-style bicubic (a=-0.75, matching OpenCV's actual INTER_CUBIC
+ * constant) -- tested hypothesis for the img_dbl upscale step, per
+ * research/PROTOCOL.md ("Leading hypotheses for the remaining sub-pixel
+ * discrepancy"): OpenSIFT's stock create_init_img uses CV_INTER_CUBIC for
+ * doubling, not bilinear. */
+static double cubic_weight(double x)
+{
+    const double a = -0.75;
+    x = fabs(x);
+    if (x <= 1.0) return (a + 2) * x * x * x - (a + 3) * x * x + 1;
+    if (x < 2.0) return a * x * x * x - 5 * a * x * x + 8 * a * x - 4 * a;
+    return 0.0;
+}
+static FImage *resize_bicubic(const FImage *src, int newRows, int newCols)
 {
     FImage *dst = img_new(newRows, newCols);
-    int r, c;
+    int r, c, i, j;
     double rowScale = (double)src->rows / newRows;
     double colScale = (double)src->cols / newCols;
     for (r = 0; r < newRows; r++) {
         double sr = (r + 0.5) * rowScale - 0.5;
         int r0 = (int)floor(sr);
         double fr = sr - r0;
+        double wr[4]; for (i = -1; i <= 2; i++) wr[i + 1] = cubic_weight(i - fr);
         for (c = 0; c < newCols; c++) {
             double sc = (c + 0.5) * colScale - 0.5;
             int c0 = (int)floor(sc);
             double fc = sc - c0;
-            double v00 = img_get(src, r0, c0);
-            double v01 = img_get(src, r0, c0 + 1);
-            double v10 = img_get(src, r0 + 1, c0);
-            double v11 = img_get(src, r0 + 1, c0 + 1);
-            double v = v00 * (1 - fr) * (1 - fc) + v01 * (1 - fr) * fc
-                     + v10 * fr * (1 - fc) + v11 * fr * fc;
-            img_set(dst, r, c, (float)v);
+            double wc[4]; for (j = -1; j <= 2; j++) wc[j + 1] = cubic_weight(j - fc);
+            double acc = 0;
+            for (i = -1; i <= 2; i++)
+                for (j = -1; j <= 2; j++)
+                    acc += wr[i + 1] * wc[j + 1] * img_get(src, r0 + i, c0 + j);
+            img_set(dst, r, c, (float)acc);
         }
     }
     return dst;
@@ -149,15 +169,18 @@ static FImage *create_init_img(const unsigned char *src, int rows, int cols,
     for (i = 0; i < rows * cols; i++) gray->data[i] = (float)src[i];
 
     if (img_dbl) {
-        /* CONFIRMED real scale factor is 1.5x, not OpenSIFT's stock 2x
-         * (research/PROTOCOL.md). Generalizing OpenSIFT's sig_diff formula
-         * (originally sqrt(sigma^2 - (INIT_SIGMA*2)^2) for exactly 2x) to
-         * an arbitrary scale s: the pre-existing blur's effective sigma
-         * scales by s once resampled onto the enlarged grid, so
-         * sig_diff = sqrt(sigma^2 - (INIT_SIGMA*s)^2). */
+        /* CONFIRMED real scale factor is 2.0x (OpenSIFT stock), per this
+         * continuation session's direct gauss_pyr inspection -- corrects
+         * the previous session's mistaken 1.5x conclusion. Kept general
+         * (parametrized by s) since the formula is correct for any scale:
+         * the pre-existing blur's effective sigma scales by s once
+         * resampled onto the enlarged grid, so
+         * sig_diff = sqrt(sigma^2 - (INIT_SIGMA*s)^2). Now using bicubic
+         * (OpenCV/OpenSIFT's actual CV_INTER_CUBIC convention) instead of
+         * bilinear for this upscale -- see resize_bicubic above. */
         double s = FOCAL_DBL_SCALE;
         double sig_diff = sqrt(sigma * sigma - SIFT_INIT_SIGMA * s * SIFT_INIT_SIGMA * s);
-        FImage *dbl = resize_bilinear(gray, (int)lround(rows * s), (int)lround(cols * s));
+        FImage *dbl = resize_bicubic(gray, (int)lround(rows * s), (int)lround(cols * s));
         gaussian_blur_f(dbl, sig_diff);
         img_free(gray);
         return dbl;
@@ -533,8 +556,17 @@ static void compute_binary_descriptor(FImage ***gauss_pyr, const FocalKeypoint *
                                        unsigned int desc[8])
 {
     FImage *im = gauss_pyr[f->octv][f->intvl];
-    float cos_o = cosf(f->ori);
-    float sin_o = sinf(f->ori); /* the real binary derives sin from
+    /* CONFIRMED via ground-truth sample-array diffing (research/PROTOCOL.md):
+     * the real algorithm's steered sampling is rotated by f->ori + PI
+     * relative to the naive convention (equivalently: negate both cos_o
+     * and sin_o). Verified directly: using the real ori and real pixel
+     * data, this single sign flip dropped sum-of-squared sample error by
+     * ~10x (1,052,610 -> ~94,447 across the 45 samples) for a real known
+     * keypoint. Likely stems from a orientation-reference-axis convention
+     * difference between this reimplementation's calc_grad_mag_ori (with
+     * its OpenSIFT-derived y-flip trick) and the real algorithm's own. */
+    float cos_o = -cosf(f->ori);
+    float sin_o = -sinf(f->ori); /* the real binary derives sin from
                                    sqrt(1-cos^2) with a sign fix -- using
                                    sinf directly here is algebraically
                                    equivalent and avoids replicating a
@@ -556,7 +588,13 @@ static void compute_binary_descriptor(FImage ***gauss_pyr, const FocalKeypoint *
     memset(desc, 0, 8 * sizeof(unsigned int));
     for (i = 0; i < FOCAL_NUM_DESCRIPTOR_BITS; i++) {
         int a = g_mode_pairs[i][0], b = g_mode_pairs[i][1];
-        if (samples[a] < samples[b]) desc[i / 32] |= (1u << (i % 32));
+        /* CONFIRMED via ground-truth diffing: comparison direction is
+         * sample[a] > sample[b] (not <). Combined with the ori+PI rotation
+         * fix above, this brought a known real keypoint's descriptor to
+         * Hamming distance 29/256 against real ground truth (down from
+         * 225/256 with < and the un-rotated convention) -- a clear,
+         * decisive match, not noise. See research/PROTOCOL.md. */
+        if (samples[a] > samples[b]) desc[i / 32] |= (1u << (i % 32));
     }
 }
 
@@ -627,4 +665,24 @@ int focal_hamming_distance(const unsigned int a[8], const unsigned int b[8])
     int i, d = 0;
     for (i = 0; i < 8; i++) d += __builtin_popcount(a[i] ^ b[i]);
     return d;
+}
+
+/* DIAGNOSTIC-ONLY test hooks (tools/step1_reproduce_samples.c) -- expose
+ * the internal Gaussian pyramid and float-image accessor so an external
+ * tool can reproduce compute_binary_descriptor's exact sampling stage for
+ * an arbitrary externally-supplied keypoint, without needing our own
+ * detector to have found a keypoint there. Not used by the real pipeline. */
+FImage ***focal_debug_get_pyramid(const unsigned char *img, int rows, int cols,
+                                   int octaves, int *outIntvlsPlus3)
+{
+    FImage *base = create_init_img(img, rows, cols, FOCAL_IMG_DBL, FOCAL_SIGMA);
+    FImage ***gpyr = build_gauss_pyr(base, octaves, FOCAL_INTVLS, FOCAL_SIGMA);
+    img_free(base);
+    *outIntvlsPlus3 = FOCAL_INTVLS + 3;
+    return gpyr;
+}
+
+float focal_debug_img_get(FImage *im, int r, int c)
+{
+    return img_get(im, r, c);
 }

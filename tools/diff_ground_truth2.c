@@ -75,7 +75,7 @@ int main(int argc, char **argv)
             float dist = sqrtf(dx*dx + dy*dy);
             float doa = fabsf(mine[i].ori - real[j].ori);
             if (doa > M_PI) doa = 2*M_PI - doa;
-            if (dist < 1.0f && doa < 0.1f) {
+            if (dist < 1.0f && doa < 0.02f) {
                 int h = focal_hamming_distance(mine[i].desc, real[j].desc);
                 sum += h; n++;
             }
