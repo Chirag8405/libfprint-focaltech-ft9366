@@ -2259,3 +2259,31 @@ pipeline mapping's hypothesis about this function's role.
 still needs resolving. Given the strength of correspondence established, moving to check it briefly, then
 proceeding to Step 3 (`FtGetMfbFeatures`, the genuinely bespoke binary descriptor with no public reference)
 since that is the highest-remaining-uncertainty piece of the whole matching pipeline.
+
+## STEP 2 WRAP-UP: FtGetMfsFeatures understood to a workable level (2026-09-16)
+
+`FtComputeDescriptors(ST_Seq *features, ST_Feature *, ST_IplImage ***, ST_IplImage ***, SINT32, SINT32)` is
+called 3 times, ALL from inside `FtGetMfsFeatures` itself (confirmed via `axt` cross-reference -- NOT called
+from `FtGetMfbFeatures`). This resolves the earlier open question in the opposite direction than guessed: the
+classic OpenSIFT-style descriptor computation happens INSIDE the detection stage, not the binary-descriptor
+stage. Its exact role is NOT fully resolved (possibilities: feeds `ST_FocalTemplate.templateBinDiscr`, used
+for some internal dedup/refinement across the 3 call sites, or is largely vestigial left over from adapting
+OpenSIFT wholesale) -- `ST_Feature` itself has no room for a 128-float descriptor (only `bDescri[8]`, 32 bytes),
+so whatever this computes is NOT what ends up in the per-feature binary descriptor used for matching. Flagged
+as an open item rather than guessed further; not blocking, since `FtGetMfbFeatures` (traced next) is confirmed
+to be the actual producer of `ST_Feature.bDescri`.
+
+### Step 2 status: workable understanding achieved, proceeding to Step 3
+Summary of confidence levels for `FtGetMfsFeatures` reimplementation:
+- Gaussian/DoG pyramid construction, scale-space extrema detection+localization (Taylor interpolation via
+  deriv/hessian/invert), edge-response rejection, orientation histogram assignment: HIGH confidence, direct
+  structural match to public OpenSIFT source, with two confirmed real parameter deltas (contrThr=0.02,
+  curvThr=15 vs. stock 0.04/10).
+- `FtInValidPixelSet` (mask integration), `FtGetKpNumMode4` (keypoint cap=160): HIGH confidence, fully traced.
+- `FtComputeDescriptors`'s exact role: OPEN, deferred (does not block downstream work).
+- Exact `imgDbl`/octave-count/`descrWidth`/`descrHistBins` runtime values at the real call site: not
+  individually pinned down (the 72-byte input struct is built via 9 raw stack pushes) -- to be resolved via
+  the planned intermediate-value validation pass rather than by hand-mapping stack offsets.
+
+Proceeding to Step 3: `FtGetMfbFeatures` (the bespoke binary descriptor, no public reference available -- the
+highest-remaining-uncertainty piece of the matching pipeline).
