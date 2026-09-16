@@ -4194,3 +4194,58 @@ separation on this sensor. The remaining honest conclusion is **option 3**: this
 implemented across every function this project has located and validated in the real `.so`, does not appear to
 provide reliable fingerprint verification -- a genuine, well-evidenced viability limit, not an unsolved
 implementation bug.
+
+## Windows-vs-Linux discrepancy investigation, STEP 1: found and tested the real missing preprocessing step (SPA smoothing) -- does not change the outcome (2026-09-17)
+
+Status: CONFIRMED via live gdb execution tracing (not static analysis) of a genuinely distinct, previously-
+untested enrollment-time function. Tested with real vendor code; reports a precise negative result.
+
+### Found: FtGetTemplateForEnroll -- a distinct enrollment function that actually runs to completion
+Full DWARF symbol search for `Enroll`/`Register`/`Setup` found dozens of real enrollment-related functions
+(the `.so` supports FocalTech's full slide-enroll/force-enroll/tips-template product line). The single most
+relevant one: `FtGetTemplateForEnroll(UINT8*, ST_FocalTemplate*)` (offset 0xb9e80, 2620 bytes) -- structurally
+distinct from `FtGetTemplate` (0xbfea0, 7451 bytes, the function all this project's later ground-truth
+extraction has either called directly or avoided due to its known `pData1`/`pData2` crash). Calling
+`FtGetTemplateForEnroll` directly (same dlopen+bias technique, manually-built 96x96 canvas, no other session
+state) **runs to completion and returns 0 (success)** -- the first "GetTemplate"-family function this entire
+project has gotten to complete without crashing.
+
+### Live-traced real execution order, confirmed robust across 3 independent captures
+Set breakpoints (by name, via DWARF) on every candidate preprocessing function
+(`FtNonLinearStretch_U8`/`FtGrayMeanSub`/`FtBadPixselDetect`/`FtLocalContrastEnhance`/`f9395_image_enhance`/
+`FtResize_8u`/`FtSpaSmooth`/`FtSegmentByLocalVariance`/`FtGenBinImg`/`FtGetMfsFeatures`/`FtGetMfbFeatures`) and
+ran `FtGetTemplateForEnroll` on `same5.raw`, `same1.raw`, and `diff1.raw` independently. **Identical result all
+three times**:
+```
+InitSPAImageSize(col=96, row=96) -> InitSPAMaskRadius(rad=5) -> InitSPAImpactFactors(zoomRatio=0)
+  -> FtSpaSmooth(canvas, impactFactor=20) -> FtGetMfbFeatures(...) -> FtGenBinImg(...) -> returns 0
+```
+**None of `FtNonLinearStretch_U8`, `FtGrayMeanSub`, `FtBadPixselDetect`, `FtLocalContrastEnhance`,
+`f9395_image_enhance`, `FtResize_8u`, `FtSegmentByLocalVariance`, or the separate `FtGetMfsFeatures` symbol are
+ever reached on this call path.** This directly CONTRADICTS an earlier session's "confirmed real pipeline"
+entry (`## FtGetTemplate pipeline mapped`, based on static `r2 axff` call-graph analysis + assumed log-string
+correlation, never live-execution-verified) which listed all of those as part of a single linear preprocessing
+chain. Live execution evidence supersedes that static-analysis guess for this call path: the ONLY step this
+project's entire ground-truth extraction methodology has been missing is **SPA smoothing**, with exact,
+now-confirmed real parameters (col=row=96, maskRadius=5, impactFactor=20, zoomRatio=0.0).
+
+### Test: wired the real SPA smoothing calls into the ground-truth harness, re-ran the full 190-pair test
+Added `tools/ground_truth_calcsimscore_batch_spa.c`: calls the REAL `InitSPAImageSize`/`InitSPAMaskRadius`/
+`InitSPAImpactFactors`/`FtSpaSmooth` (exact confirmed parameters above) on the canvas before mask/binarization/
+feature extraction, otherwise identical to the earlier harness. Re-ran the full `varied_set` 190-pair test:
+```
+                    without SPA smoothing        with SPA smoothing (real, confirmed step)
+SAME-finger:        n=65  avg=0.9249             n=65  avg=0.9501
+DIFFERENT-finger:    n=125 avg=0.9315             n=125 avg=0.9546
+gap:                -0.0066                       -0.0045
+```
+Absolute scores shifted up slightly (both categories), consistent with SPA smoothing's noise-reduction role
+genuinely changing pixel content -- but **the gap remains negative (inverted) and of essentially the same
+tiny magnitude**. SPA smoothing is a real, confirmed, now-correctly-applied step, but it does NOT explain the
+Windows-vs-Linux discrepancy on its own.
+
+### STEP 1 conclusion
+The specific hypothesis (a missing enhancement-chain step causing diluted signal) is NOT the explanation, at
+least not via the one real, confirmed gap found (SPA smoothing) through the one genuinely distinct enrollment
+function located (`FtGetTemplateForEnroll`). Proceeding to Step 2 (quality gating) and Step 3 (calibration
+completeness) per the bounded investigation plan.
