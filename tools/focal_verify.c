@@ -116,18 +116,30 @@ typedef struct { int ia, ib; } Correspondence;
 /* BEST-EFFORT: candidate correspondence generation via best-Hamming-match
  * per feature (with a distance cutoff). Not FocalTech's own traced
  * FtRecallBinCheck/getLocalFeature (not disassembled in depth). */
+/* Ratio test added per the RANSAC audit conclusion (research/PROTOCOL.md,
+ * "Follow-up: quantified and tested a RANSAC chance-collision hypothesis"):
+ * a lone Hamming-distance cutoff is not selective enough on this sensor,
+ * since candidate correspondences that are wrong on descriptor grounds can
+ * still look geometrically plausible (near-identity transform) purely
+ * because keypoint spatial layout is constrained by the same small
+ * contact-area shape across any two captures. Requiring the best match to
+ * beat the second-best by a real margin (the standard SIFT/ORB safeguard,
+ * Lowe's ratio test) is intended to reject exactly this failure mode. */
 static int find_candidates(const FocalFeature *A, int na, const FocalFeature *B, int nb,
-                            int maxDist, Correspondence **out)
+                            int maxDist, double maxRatio, Correspondence **out)
 {
     Correspondence *c = malloc((size_t)na * sizeof(Correspondence));
     int n = 0, i, j;
     for (i = 0; i < na; i++) {
-        int best = 257, bestj = -1;
+        int best = 257, second = 257, bestj = -1;
         for (j = 0; j < nb; j++) {
             int d = focal_hamming_distance(A[i].desc, B[j].desc);
-            if (d < best) { best = d; bestj = j; }
+            if (d < best) { second = best; best = d; bestj = j; }
+            else if (d < second) { second = d; }
         }
-        if (best <= maxDist) { c[n].ia = i; c[n].ib = bestj; n++; }
+        if (best <= maxDist && (double)best <= maxRatio * (double)second) {
+            c[n].ia = i; c[n].ib = bestj; n++;
+        }
     }
     *out = c;
     return n;
@@ -248,6 +260,40 @@ static void binarize_local_mean(const unsigned char *img, int rows, int cols,
         }
 }
 
+/* Closer match to the CONFIRMED FtGenBinImgForSamllSensor algorithm
+ * (research/PROTOCOL.md): 3x3 median filter, then local-mean adaptive
+ * threshold. The earlier binarize_local_mean skipped the median
+ * pre-filter entirely -- median filtering suppresses salt-and-pepper
+ * noise before thresholding, which plain local-mean thresholding does
+ * not, and could plausibly be adding noise-driven disagreement pixels
+ * that swamp the real ridge-agreement signal in calc_sim_score. */
+static void binarize_median_adaptive(const unsigned char *img, int rows, int cols,
+                                      int blockSize, unsigned char *out)
+{
+    unsigned char *med = malloc((size_t)rows * cols);
+    int r, c;
+    for (r = 0; r < rows; r++)
+        for (c = 0; c < cols; c++) {
+            unsigned char win[9];
+            int n = 0, rr, cc;
+            for (rr = r - 1; rr <= r + 1; rr++)
+                for (cc = c - 1; cc <= c + 1; cc++) {
+                    int sr = rr < 0 ? 0 : (rr >= rows ? rows - 1 : rr);
+                    int sc = cc < 0 ? 0 : (cc >= cols ? cols - 1 : cc);
+                    win[n++] = img[sr * cols + sc];
+                }
+            /* insertion sort, n=9 */
+            for (int i = 1; i < n; i++) {
+                unsigned char v = win[i]; int j = i - 1;
+                while (j >= 0 && win[j] > v) { win[j + 1] = win[j]; j--; }
+                win[j + 1] = v;
+            }
+            med[r * cols + c] = win[4];
+        }
+    binarize_local_mean(med, rows, cols, blockSize, out);
+    free(med);
+}
+
 /* Top-level entry mirroring FtVerifyTwoTemplate's role: given two
  * feature sets + their source images (for binarization/masking), returns
  * the final similarity score (0..1) via the confirmed formula. */
@@ -256,7 +302,7 @@ float focal_verify_two_templates(const FocalFeature *A, int na, const unsigned c
                                   int rows, int cols, int *outInliers, int *outCandidates)
 {
     Correspondence *cand;
-    int ncand = find_candidates(A, na, B, nb, 90, &cand);
+    int ncand = find_candidates(A, na, B, nb, 90, 0.85, &cand);
     *outCandidates = ncand;
 
     if (ncand < 3) { free(cand); *outInliers = 0; return 0.0f; }
@@ -295,8 +341,8 @@ float focal_verify_two_templates(const FocalFeature *A, int na, const unsigned c
     memcpy(enhB, imgB, (size_t)n);
     focal_local_contrast_enhance(enhA, rows, cols, 9);
     focal_local_contrast_enhance(enhB, rows, cols, 9);
-    binarize_local_mean(enhA, rows, cols, 5, binA);
-    binarize_local_mean(enhB, rows, cols, 5, binB);
+    binarize_median_adaptive(enhA, rows, cols, 5, binA);
+    binarize_median_adaptive(enhB, rows, cols, 5, binB);
     free(enhA); free(enhB);
 
     int overlap;

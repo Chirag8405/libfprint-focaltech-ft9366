@@ -2706,3 +2706,39 @@ next steps for a future session, in priority order:
    used only as a one-shot candidate-selection pre-filter.
 3. Synthetic controlled-image testing (translated/rotated known patterns) remains a good complementary check,
    not yet done.
+
+## Fourth fix attempt (proper median+adaptive binarization) -- also inconclusive; pattern is mechanism-independent (2026-09-16)
+
+Status: Implemented `binarize_median_adaptive` (3x3 median filter + local-mean adaptive threshold), replacing
+the cruder direct local-mean placeholder, to more closely match the CONFIRMED `FtGenBinImgForSamllSensor`
+algorithm shape. Retested the full 45-pair set: **virtually no change from the previous result.**
+
+### Four independent, well-reasoned fixes attempted this session, all inconclusive
+1. OpenSIFT fidelity fixes (nearest-neighbor octave downsampling, `feature_mat` dedup bitmask)
+2. RANSAC inlier-radius tightening, quantitatively justified (6px -> 2.5px)
+3. Candidate correspondence ratio test (Lowe's ratio test, standard SIFT/ORB safeguard)
+4. Proper median-filter + adaptive-threshold binarization (matching the confirmed real algorithm's shape)
+
+None of these changed the qualitative outcome: same5/same6 persistently score high (~0.65-0.91) against
+EVERY other capture regardless of true finger identity; same1/same2 persistently score low (~0.49-0.73)
+against everything regardless of true finger identity. This pattern's *persistence across four unrelated
+mechanism changes* is itself the most important finding here: it rules out each of those four mechanisms as
+the primary cause, and points toward something more fundamental -- most likely a real, not-yet-located bug in
+feature detection/description (Step 2/3) that makes descriptors correlate with some capture-level property
+(e.g. overall contrast/quality) rather than true ridge-identity-specific structure, since that would produce
+exactly this "some captures match everything, others match nothing" signature independent of downstream
+matching-parameter choices. The line-by-line OpenSIFT audit did not find this bug, but did not prove its
+absence either -- absence of evidence, not evidence of absence.
+
+### Honest overall assessment after this session's full debugging effort
+This session made real, substantial, honestly-reported progress: a complete architectural understanding of
+FocalTech's real algorithm (Steps 1-4, all confirmed via disassembly/DWARF/public-reference cross-checking),
+a full first-draft C reimplementation with zero runtime dependency on the proprietary binary, and four
+rigorous, quantified debugging attempts against real captures -- none of which, so far, produced a working
+matcher. Continuing to try further isolated parameter/mechanism changes without a new diagnostic anchor is
+reaching diminishing returns, per this project's own established discipline. The two real options going
+forward: (a) revisit whether real-`.so` intermediate-value comparison should be reconsidered for VALIDATION
+purposes only (distinct from the earlier "should we ship calling it" decision, which this is not) now that
+four independent fix attempts have failed to find the cause by other means, or (b) continue with synthetic/
+controlled-input testing and further manual code audit in a future session. This is a genuine decision point
+worth surfacing rather than guessing further.
