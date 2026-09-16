@@ -1875,3 +1875,44 @@ the two large SIFT-like/binary-descriptor stages.
 
 Not yet done: bit-exact validation of this hypothesis against real captured data (deferred, per plan, until
 enough of the pipeline is reimplemented to diff a real intermediate buffer via gdb).
+
+## Update: curved_surface_img_localequalizehist_v2 partially traced -- genuine ambiguity flagged (2026-09-16)
+
+Status: PARTIAL (structure confirmed via decompiler; inner histogram/counting logic NOT fully resolved --
+flagging honestly rather than guessing)
+
+### Confirmed structure
+`curved_surface_img_localequalizehist_v2(UINT8 *src, UINT8 *mask, SINT32 rows, SINT32 cols, UINT8 *dst)`:
+- Allocates a local `hist[256]` (SINT32) buffer, zeroed -- but notably it is NOT obviously indexed by pixel
+  value in the visible decompiled logic (see ambiguity below), so "histogram" may be a misleading name for what
+  this actually computes.
+- Pads BOTH the source image and the mask via `curved_surface_img_makeborder_constprop_1` (an OpenCV
+  `copyMakeBorder`-shaped helper, not yet independently traced) before processing -- confirmed via two
+  back-to-back calls with matching argument shape.
+- Padding size hints at an **asymmetric local window**: `(rows+54)` used for one buffer dimension vs. an inner
+  loop bound of `cols+2`-ish for the other -- suggestive of a local window that is tall/narrow (elongated along
+  one axis), which would be a sensible, deliberate design for ridge-oriented local processing rather than an
+  arbitrary window shape. NOT independently confirmed as intentional -- flagged as a plausible reading, not
+  fact.
+- Per output pixel: scans a window of ~55 rows at the current column from the (bordered) buffer, accumulates
+  some quantity into `edi` (count) and `edx` (sum) conditionally, then computes
+  `output = (sum*256 - sum) / count = sum*255/count` as the final per-pixel value when `count != 0`
+  (else leaves the pre-zeroed value, i.e. 0).
+
+### Genuine ambiguity, not resolved
+The decompiler's rendering of the inner 55-row scan loop reads a byte into a temporary (`esi = *(rcx)`) that is
+never visibly used again before the loop's unconditional `edi += 0x37` -- i.e. it is not obviously gating on
+the read value or writing it into a per-value histogram bucket the way a classic intensity histogram would.
+This strongly suggests r2dec is dropping or obscuring a real conditional (very likely: only count/accumulate
+when the corresponding MASK byte at that position is nonzero -- consistent with this function receiving a mask
+parameter at all), but this has NOT been confirmed from raw disassembly yet -- explicitly not guessing further
+here per this session's "don't round up ambiguous results" rule.
+
+### Decision: defer full resolution, proceed with best-effort + empirical validation later
+Fully hand-verifying this function's inner loop via raw disassembly (the same rigor applied to
+`FtNonLinearStretch_U8`) would cost meaningfully more time, and this session's own validation plan already
+calls for diffing real `.so` intermediate buffers via `gdb` once enough of the pipeline is reimplemented to do
+so -- that empirical check will catch a wrong guess here regardless of how it's arrived at. Proceeding to the
+next preprocessing stage now; will return to nail this function's exact inner logic with a raw-disassembly
+pass (same method as `FtNonLinearStretch_U8`) before or during the intermediate-value validation pass, not
+skipping it permanently.
