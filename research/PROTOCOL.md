@@ -1259,3 +1259,54 @@ This is not yet a working `fprintd-enroll`/`fprintd-verify` -- reaching that req
 stages (AutoSDacUpdate calibration feedback, `poa_send_para`, and likely template extraction/matching, which
 may be match-on-chip and not yet located). But this is the clearest, most direct evidence so far that this
 project's reverse-engineered protocol can pull real, meaningful fingerprint data off the sensor.
+
+## STEP 1 ANSWERED: match-on-chip architecture question resolved (2026-09-16)
+
+Status: CONFIRMED via extensive symbol evidence in the proprietary binary
+
+### Finding: this is HOST-SIDE software matching, NOT match-on-chip / secure-element comparison
+
+The proprietary binary (`~/focaltech-ft9366-arch-shim/libfprint-2.so.2.0.0`) contains an entire proprietary
+biometric SDK statically linked in, with hundreds of relevant symbols:
+
+- Template extraction: `focal_GetImageTemplate`, `FtGetTemplate`, `FtGetTemplateForEnroll`,
+  `FtDataToFocalTemplate`, `FtFocalTemplateToData`
+- Template matching: `FtVerifyByTemplate`, `FtTemplate2TemplateMatch`, `FtVerifyTwoTemplate`,
+  `focal_VerifyTwoTemplate`, `bz_match`, `bz_match_score`, `fpi_print_bz3_match`
+- Enrollment flow: `focal_Enroll`, `focal_EnrollByImage`, `FtEnrollByTemplate`, `fp_device_enroll`,
+  `fpi_device_enroll_complete`, `fpi_device_get_enroll_data`
+- Verify flow: `fp_device_verify`, `fpi_device_verify_report`, `fpi_device_verify_complete`,
+  `fpi_device_get_verify_data`
+
+This confirms the binary is a **custom build of libfprint itself** (matching the earlier-found leftover build
+path `chips/fw9366/fw9366_spider...` and "kylin" OS references) with a large proprietary FocalTech biometric
+algorithm library statically linked in as the template-extraction/matching backend, exposed through
+libfprint's own standard `fp_device_enroll`/`fp_device_verify` API. The sensor itself is confirmed to be a
+"dumb" (relatively) image-capture device -- exactly matching what this session independently
+reverse-engineered and validated (`img_data_get` pulling a real, visually-confirmed fingerprint ridge image).
+All template extraction and comparison happens in **host-side software**, not inside a hidden secure element
+on the chip.
+
+### NSS/PK11 crypto usage -- CONFIRMED unrelated to the FT9366 path
+
+Call sites of `NSS_NoDB_Init`, `PK11_ImportSymKey`, `PK11_CreateContextBySymKey`, `PK11_ParamFromIV`,
+`PK11_CipherOp` (flagged in earlier binary analysis, before this session began) all trace to a single function
+(`dev_init` at `0x31da0`) that also calls `fpi_device_uru4000_get_type` and references symbols `crkey` and
+`uru4k_dev_info`. **URU4000** is a real, unrelated, mainline-libfprint-supported DigitalPersona fingerprint
+reader with its own well-documented simple image-decryption scheme (a static key, historically called `crkey`
+in real upstream libfprint source too). This crypto path belongs entirely to that separately-compiled-in
+stock driver, not to any FocalTech/FT9366-specific code. **CONFIRMED: no crypto/secure-element layer protects
+or is otherwise involved in the FT9366 capture, template, or matching path.**
+
+### Practical implication for the rest of this session's plan (per Step 1's own instructions, not stopping to ask)
+
+STEP 5 ("build the actual enroll/verify path") now clearly means: **host-side image/template matching is
+required** -- there is no simple "ask the chip yes/no" command pair to find. This is confirmed to be a
+larger, distinct sub-project (matching this session's own pre-flagged contingency): either integrating an
+existing open fingerprint-matching approach (e.g. minutiae extraction + Bozorth3-style matching, as hinted by
+the `bz_match`/`bz3` naming in the proprietary SDK, though that specific implementation is proprietary and not
+being reused) or a simpler image-correlation approach sufficient to meet the stated bar (same finger reliably
+matches, different finger/no finger reliably doesn't) as an initial milestone, with room to improve robustness
+later. Proceeding to Steps 2-4 (calibration feedback, poa_send_para, frame data functions) first, since they
+are still required regardless of the matching approach chosen, then returning to Step 5 with this scope
+understood.
