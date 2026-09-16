@@ -1546,3 +1546,53 @@ This confirms DAC calibration genuinely matters and is a very plausible contribu
 failure: uncalibrated captures could land at very different points in this range depending on incidental
 conditions, adding large brightness-driven variance between captures of the same finger that has nothing to
 do with the actual ridge pattern.
+
+## STEP 2 RESULT: calibration + alignment tested with a full sample set -- STILL FAILS, robustly (2026-09-16)
+
+Status: TESTED with a statistically meaningful sample set (10 live captures, 45 pairwise comparisons). Result:
+correlation-based matching does NOT separate same-finger from different-finger, even with calibration and
+rotation+translation alignment.
+
+### Setup
+All 10 captures taken at a SINGLE locked calibration point (`FIXED_DAC=0x35`, converged via the real
+calibration loop above) to ensure consistent gain/fixed-pattern-noise conditions across the whole set --
+critical, since calibrating separately per-capture would adapt to whatever's on the sensor at that moment and
+invalidate background subtraction. avg_middle stayed tight (307-321) across all 10 captures, confirming
+consistent gain was achieved.
+
+- 1 no-finger baseline (`cal_baseline.raw`, avg_middle=496)
+- 6 same-finger captures (`same1..6.raw`, avg_middle 309-321), repositioned slightly each time
+- 4 different-finger captures (`diff1..4.raw`, avg_middle 307-315)
+
+All saved to `research/captures/calibrated_set/`.
+
+### Method
+Background-subtract the baseline, local high-pass filter (radius 3), then search over rotation
+(-6,-3,0,3,6 degrees, bilinear resample) x translation (+/-6px) for the best normalized cross-correlation.
+
+### Full results (45 comparisons)
+```
+SAME-finger pairs (n=15):      min=0.7439  max=0.9401  avg=0.8305
+SAME-vs-DIFFERENT pairs (n=24): min=0.7534  max=0.9548  avg=0.8489
+DIFFERENT-vs-DIFFERENT (n=6):   min=0.7838  max=0.9435  avg=0.8651
+```
+
+**The three distributions overlap heavily and are not usefully separable.** DIFFERENT-vs-DIFFERENT actually
+scores HIGHEST on average (0.8651), same-finger scores LOWEST (0.8305) -- backwards again, and now confirmed
+with a much larger, more statistically meaningful sample than the earlier 3-capture test. This rules out
+"small sample size" or "bad luck" as an explanation. Calibration and alignment (both now real, tested,
+confirmed working individually) did not fix the underlying separation problem.
+
+### Conclusion: this is not a tuning problem
+Per this session's own pre-set trigger condition: correlation-based matching, even properly calibrated and
+aligned, does not cleanly separate same vs. different finger on this sensor's captured data. Continuing to
+adjust correlation parameters (filter radius, shift range, angle range, thresholds) is not expected to fix a
+result this consistently and robustly wrong across 45 real comparisons. The likely explanation: at this
+sensor's native resolution (64x80 = 5120 pixels total) and/or with the image quality achieved, whole-image
+correlation is dominated by gross contact-area/pressure/moisture characteristics rather than the fine ridge
+detail needed for identity discrimination -- exactly the class of problem real fingerprint systems solve with
+minutiae extraction instead of raw image correlation, not incidentally.
+
+### Next: STEP 3 -- evaluate minutiae-based matching
+Per instructions, not tweaking correlation further. Proceeding to check whether libfprint itself exposes
+reusable minutiae extraction/matching primitives before writing anything from scratch.
