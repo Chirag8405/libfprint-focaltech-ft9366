@@ -2742,3 +2742,87 @@ purposes only (distinct from the earlier "should we ship calling it" decision, w
 four independent fix attempts have failed to find the cause by other means, or (b) continue with synthetic/
 controlled-input testing and further manual code audit in a future session. This is a genuine decision point
 worth surfacing rather than guessing further.
+
+## MAJOR GROUND-TRUTH FINDING: real algorithm's working canvas is 96x96, not 64x80 -- confirmed via real .so (2026-09-16)
+
+Status: CONFIRMED via direct calls into the real proprietary `.so` (diagnostic-only, per this session's explicit
+decision -- never shipped, never used at runtime; see the DECISION note at the top of this session's
+continuation). This is the single highest-value fact extracted from the ground-truth effort and very likely
+explains a large part of the whole session's matching failure.
+
+### Method
+Built `tools/ground_truth_dump.c`: `dlopen()`s the real `.so`, computes a load-bias using an exported anchor
+symbol (`fp_device_verify`, in `.dynsym`), and calls `FtGetTemplate` (a LOCAL symbol, called via computed
+`bias + static_file_offset`) directly with our own real captured images, bypassing the need to reconstruct
+`FtGetMfsFeatures`'s complex by-value struct argument. Required `RTLD_LAZY` (the `.so` has unresolved libgusb
+symbol version dependencies that block `RTLD_NOW`, irrelevant to the pure-algorithm code path being called) and
+manually initializing one uninitialized global pointer (`gFocalTempupdateInfor`, which `FtGetTemplate`
+dereferences early for an unrelated "template update tracking" feature) to a scratch allocation.
+
+### The finding: `gSensorInfor` (real, compiled-in `.data` global, address `0x211a80`, right after `gAlgInfor`)
+```c
+struct ST_FocalSensorInfo {   // CONFIRMED via DWARF + raw .data bytes, not runtime garbage
+    UINT32 sensorCols;   // = 96
+    UINT32 sensorRows;   // = 96
+    UINT32 enrollMaxTplCount;  // = 16
+    UINT32 algMaxTplCount;     // = 48
+    ...
+    UINT16 maxKpNum;      // = 160 -- matches the already-confirmed FtGetKpNumMode4()==0xa0 exactly
+    UINT8 isSmallSensor;  // = 0 (FALSE)
+    UINT8 spaFilterEn;    // = 1  (matches the already-traced FtSpaSmooth being in the pipeline)
+    ...
+};
+```
+**`sensorCols`/`sensorRows` = 96x96 -- NOT this sensor's actual native 64x80 wire resolution.** Verified stable
+and identical across multiple different real captures (same1.raw, same5.raw, diff1.raw all gave the exact same
+96/96), ruling out per-image runtime noise -- this is a fixed, compiled-in constant.
+
+### Independently cross-confirmed via live struct inspection at the crash point
+Breaking inside `FtGetTemplate` (which crashes deeper in its own internal buffer-population chain, see below)
+and inspecting its real local variables directly (`stBinlimage`, `stIplimageScale` -- both fully DWARF-named
+and readable):
+```
+stBinlimage:     {depth=8, width=96,  height=96,  imageSize=9216,  widthStep=96}   -- matches sensorCols/Rows
+stIplimageScale: {depth=8, width=144, height=144, imageSize=20736, widthStep=144}  -- the "doubled" canvas
+imgSize:      {row=96,  col=96}
+imgSizeScale: {row=144, col=144}
+```
+The 96->144 relationship was independently confirmed via the actual disassembly arithmetic too: `imgSizeScale
+= round(gSensorInfor.sensorDim * 3 / 2)` (a `lea [x+x*2]` then arithmetic-shift-right-1 idiom, i.e. exactly
+`x*3/2` -- NOT `x*2`). **This is a real, mechanistically-confirmed 1.5x scale factor for the "image doubling"
+stage, not OpenSIFT's stock 2x.**
+
+### Practical implication -- this session's reimplementation has been using the WRONG working geometry entirely
+`focal_sift.c` operates directly on the sensor's native 64x80 capture and doubles it to 128x160 (2x), assuming
+OpenSIFT's stock `img_dbl` convention applies literally. The real algorithm instead works on a FIXED, sensor-
+independent 96x96 canvas (this shared `.so` supports multiple FocalTech chip variants -- FT9366/9368/9371/
+9362/9391/9349 -- of presumably different native resolutions, so a fixed internal working size makes sound
+engineering sense), scaled by 1.5x (not 2x) to 144x144 for the enlarged detection pass. This is almost
+certainly a major, previously-unlocated contributor to the whole session's separation failure: every DoG
+pyramid level, every keypoint coordinate, every descriptor sample radius has been computed against the wrong
+canvas size and the wrong scale factor throughout.
+
+**Not yet confirmed**: the EXACT method by which the native 64x80 capture becomes a 96x96 canvas (centered
+zero-padding -- the natural, aspect-ratio-preserving choice, and what was tested -- vs. some other embedding).
+Reasoned (not disassembly-confirmed) case for padding over stretching: 64x80's aspect ratio (0.8) differs from
+96x96's (1.0), so a naive resize would distort ridge geometry, which a well-engineered fingerprint algorithm
+would avoid; padding preserves true pixel geometry. `FtResize_8u`'s own call site fits the 96->144 stage far
+more naturally (a uniform, non-distorting 1.5x scale) than a 64x80->96x96 stage would.
+
+### Honest stopping point on full keypoint/descriptor ground-truth extraction
+Getting `FtGetTemplate` to run to actual completion (to dump real keypoints/descriptors, per the original Step
+1 ask) hit a deeper wall: even after fixing the `gFocalTempupdateInfor` crash and testing the padding
+hypothesis, execution crashes again inside FtGetTemplate's own internal buffer-population code (`pData1`/
+`pData2`, further scratch buffers that are themselves never populated with real content -- filled with
+leftover/poisoned heap bytes, `stIplimage`'s own metadata fields also unpopulated at the crash point). This
+points to at least one more layer of hidden dependency on proper session/device initialization state that a
+cold, direct call into `FtGetTemplate` doesn't satisfy. Continuing to chase this via further gdb probing was
+judged to have reached diminishing returns relative to acting on the high-value 96x96/144x144 finding already
+in hand and testing it against the real bar (does the full same/different-finger dataset separate correctly)
+-- consistent with this session's own established discipline about not chasing diminishing returns. The
+partial ground truth here is being reported honestly as partial, not rounded up to "full validation."
+
+### Next concrete action
+Rework `focal_sift.c`/`tools/test_focal_verify.c` to pad the real 64x80 capture into a 96x96 canvas (centered,
+zero-padded) as the actual detection input, and use a 1.5x (not 2x) scale for the enlarged pass, then re-run
+the full 45-pair same/different-finger test and report the result plainly.
