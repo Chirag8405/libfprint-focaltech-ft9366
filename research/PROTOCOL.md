@@ -3225,3 +3225,65 @@ Apply the same ground-truth-diffing discipline to `FtVerifyTwoTemplate`: extract
 candidate-pair count, real RANSAC inlier set, or real final score) for a known same-finger and known
 different-finger pair via the same gdb/dlopen technique, and diff against `focal_verify_two_templates`'s own
 intermediate output to localize whether the bug is in candidate generation, RANSAC, or scoring.
+
+## Matching-stage follow-up: exact binarization threshold fixed via raw disassembly; candidate threshold ruled out; separation still unresolved (2026-09-16)
+
+Status: Two more concrete fixes attempted following the confirmed descriptor fix above. Both are real,
+disassembly-confirmed corrections, kept in the code. Neither resolves same/different-finger separation.
+
+### Fix: exact FtLocalThreshold binarization formula extracted via raw disassembly
+The previous `binarize_median_adaptive` used a naive `pixel > localMean` split. Raw-disassembled
+`FtGenBinImgForSamllSensor`'s call into `FtLocalThreshold` (offsets 0x10a670/0xffab0) and extracted the exact
+formula and constants from `.rodata`:
+```
+inv[i] = 255 - medianFiltered[i]                          (byte-inverted BEFORE mean/var, confirmed at 0xffbc8)
+mean[i], var[i] = local mean/variance of inv[] over a 5x5 window (FtLocalMeanVar, blockSize=5)
+threshold[i] = mean[i] * (0.9 + 0.1/128 * sqrt(var[i]))    (constants 0.1@0x188398, 1.0@0x179b00, 1/128@0x1a9824 -- all exact IEEE-754 values, not estimated)
+bin[i] = 1 if threshold[i] <= inv[i] else 0
+```
+Applied to `focal_verify.c`'s `binarize_median_adaptive`. This is a real, materially different (and now
+disassembly-exact, not best-effort) algorithm from the previous placeholder. Re-ran the full 45-pair test:
+scores shifted upward overall (now ~0.52-0.90 for both same and different-finger pairs, vs ~0.48-0.86 before)
+but **remain fully overlapping, no separation** -- consistent with a prior session's own "Fourth fix attempt"
+finding that binarization formula accuracy is not the bottleneck.
+
+### Ruled out: candidate-matching Hamming threshold, swept systematically
+The existing candidate threshold (Hamming<=90) was tuned in an earlier session against the OLD, buggy
+descriptor (whose true matches averaged ~142/256, statistically indistinguishable from noise). Now that the
+descriptor fix makes true matches average ~24/256, a threshold of 90 is far looser than needed and could
+plausibly admit many false candidates. Added a diagnostic env-var override (`FOCAL_CAND_MAXDIST`) and swept
+90/70/60/50/40/35/30 against the full 45-pair set: **same-finger and different-finger score distributions stay
+statistically indistinguishable at every threshold tested** (e.g. at maxDist=30: same avg=0.794 range
+0.729-0.891; different-involving avg=0.803 range 0.714-0.903). Also checked RANSAC inlier-count/candidate-count
+ratio as an alternative discriminator instead of the final score -- no separation there either (e.g.
+same5-vs-diff1 ratio 0.708 is as high as same1-vs-same6's 0.810).
+
+### Six independent fix attempts across two sessions, all inconclusive on this specific symptom
+1. OpenSIFT fidelity fixes (nearest-neighbor octave downsampling, feature_mat dedup bitmask)
+2. RANSAC inlier-radius tightening (6px -> 2.5px), quantitatively justified
+3. Candidate correspondence ratio test (Lowe's ratio test)
+4. Median+adaptive-threshold binarization (first pass, best-effort formula)
+5. **This session:** exact disassembly-confirmed binarization threshold formula
+6. **This session:** candidate Hamming threshold systematically swept 30-90
+
+None resolved same/different-finger separation, despite the underlying descriptor itself now being independently
+confirmed accurate (24/256 avg Hamming on tight ground-truth matches, versus ~128/256 expected for random). This
+is a strong, converging signal that the remaining problem is NOT a tunable parameter or a binarization/threshold
+detail, and is most likely one of:
+(a) a genuine, not-yet-found bug in `calc_feature_oris` or another part of detection/orientation not yet
+    ground-truth-diffed the way the descriptor sampling was,
+(b) the RANSAC affine-consensus mechanism itself (`FtRansacAngle_32f`/`FtRansacEdage_32f`, each ~4-6KB, never
+    raw-disassembled -- deliberately deferred twice now as "standard technique") using a fundamentally different
+    consensus criterion than this reimplementation's plain spatial-inlier-radius RANSAC, e.g. weighting
+    descriptor similarity into consensus scoring rather than using it only as a one-shot candidate pre-filter, or
+(c) a structural property of this sensor (64x80, near-constant contact-area shape, quasi-periodic ridge pattern)
+    that makes whole-image binarized-ridge agreement after a loosely-constrained affine fit from only 10-20
+    correspondences inherently a weak identity signal, requiring either far more correspondences, a stricter
+    affine model, or a different scoring approach than pure ridge-overlap-rate.
+
+### Recommendation for next session
+Raw-disassemble `FtRansacAngle_32f`/`FtRansacEdage_32f` in full (the one substantial remaining undissected
+piece of the matching pipeline) rather than continuing to tune this reimplementation's standard-RANSAC
+stand-in -- this is the one hypothesis in the list above that hasn't been directly tested against real
+ground truth at all, and the deliberate-deferral rationale ("standard technique, parameters can be tuned
+empirically") has now been empirically exhausted without success across six attempts.

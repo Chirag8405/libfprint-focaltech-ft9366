@@ -260,38 +260,82 @@ static void binarize_local_mean(const unsigned char *img, int rows, int cols,
         }
 }
 
-/* Closer match to the CONFIRMED FtGenBinImgForSamllSensor algorithm
- * (research/PROTOCOL.md): 3x3 median filter, then local-mean adaptive
- * threshold. The earlier binarize_local_mean skipped the median
- * pre-filter entirely -- median filtering suppresses salt-and-pepper
- * noise before thresholding, which plain local-mean thresholding does
- * not, and could plausibly be adding noise-driven disagreement pixels
- * that swamp the real ridge-agreement signal in calc_sim_score. */
+/* CONFIRMED via raw disassembly of FtGenBinImgForSamllSensor/FtLocalThreshold
+ * (research/PROTOCOL.md, this session's follow-up): the real algorithm is NOT
+ * a plain "pixel > local mean" split. The exact steps, with exact extracted
+ * constants:
+ *   1. 3x3 median filter (FtMedianFilter, ksize=1 -- window shape/mirror
+ *      padding not independently traced, using a standard 3x3 clamped
+ *      median as a reasonable stand-in).
+ *   2. Byte-invert the median-filtered image (FtLocalThreshold's ksize=1
+ *      path does `inv[i] = ~medImg[i]`, i.e. 255-medImg[i], BEFORE any
+ *      mean/var computation -- confirmed at raw disassembly offset
+ *      0xffbc8 in FtLocalThreshold).
+ *   3. Compute local mean and local variance of the INVERTED image over a
+ *      blockSize x blockSize window (FtLocalMeanVar, blockSize=5 at the
+ *      real call site).
+ *   4. Per-pixel threshold (confirmed exact constants from .rodata:
+ *      0.1 @0x188398, 1.0 @0x179b00, 0.0078125=1/128 @0x1a9824):
+ *        threshold[i] = mean[i] * (1.0 - 0.1 + 0.1/128 * sqrt(var[i]))
+ *                     = mean[i] * (0.9 + 0.00078125 * localStdDev[i])
+ *      bin[i] = 0xFF if threshold[i] <= inv[i], else 0.
+ * This replaces the previous placeholder (plain local-mean threshold with
+ * no bias term), which is a materially different, much cruder rule. */
 static void binarize_median_adaptive(const unsigned char *img, int rows, int cols,
                                       int blockSize, unsigned char *out)
 {
-    unsigned char *med = malloc((size_t)rows * cols);
+    int n = rows * cols;
+    unsigned char *med = malloc((size_t)n);
+    unsigned char *inv = malloc((size_t)n);
+    float *mean = malloc((size_t)n * sizeof(float));
+    float *var = malloc((size_t)n * sizeof(float));
     int r, c;
+
     for (r = 0; r < rows; r++)
         for (c = 0; c < cols; c++) {
             unsigned char win[9];
-            int n = 0, rr, cc;
+            int m = 0, rr, cc;
             for (rr = r - 1; rr <= r + 1; rr++)
                 for (cc = c - 1; cc <= c + 1; cc++) {
                     int sr = rr < 0 ? 0 : (rr >= rows ? rows - 1 : rr);
                     int sc = cc < 0 ? 0 : (cc >= cols ? cols - 1 : cc);
-                    win[n++] = img[sr * cols + sc];
+                    win[m++] = img[sr * cols + sc];
                 }
-            /* insertion sort, n=9 */
-            for (int i = 1; i < n; i++) {
+            for (int i = 1; i < m; i++) {
                 unsigned char v = win[i]; int j = i - 1;
                 while (j >= 0 && win[j] > v) { win[j + 1] = win[j]; j--; }
                 win[j + 1] = v;
             }
             med[r * cols + c] = win[4];
         }
-    binarize_local_mean(med, rows, cols, blockSize, out);
-    free(med);
+
+    for (r = 0; r < n; r++)
+        inv[r] = (unsigned char)(0xFF - med[r]);
+
+    int rad = blockSize / 2;
+    for (r = 0; r < rows; r++)
+        for (c = 0; c < cols; c++) {
+            long sum = 0, sumSq = 0; int cnt = 0, rr, cc;
+            for (rr = r - rad; rr <= r + rad; rr++) {
+                if (rr < 0 || rr >= rows) continue;
+                for (cc = c - rad; cc <= c + rad; cc++) {
+                    if (cc < 0 || cc >= cols) continue;
+                    int v = inv[rr * cols + cc];
+                    sum += v; sumSq += v * v; cnt++;
+                }
+            }
+            float m = (float)sum / cnt;
+            mean[r * cols + c] = m;
+            var[r * cols + c] = (float)sumSq / cnt - m * m;
+        }
+
+    for (r = 0; r < n; r++) {
+        float v = var[r] > 0.0f ? var[r] : 0.0f;
+        float threshold = mean[r] * (0.9f + 0.00078125f * sqrtf(v));
+        out[r] = (threshold <= (float)inv[r]) ? 1 : 0;
+    }
+
+    free(med); free(inv); free(mean); free(var);
 }
 
 /* Top-level entry mirroring FtVerifyTwoTemplate's role: given two
@@ -302,7 +346,12 @@ float focal_verify_two_templates(const FocalFeature *A, int na, const unsigned c
                                   int rows, int cols, int *outInliers, int *outCandidates)
 {
     Correspondence *cand;
-    int ncand = find_candidates(A, na, B, nb, 90, 0.85, &cand);
+    /* DIAGNOSTIC: temporary env override to sweep candidate threshold
+     * empirically (2026-09-16 follow-up to the descriptor fix -- see
+     * PROTOCOL.md). Defaults to the existing 90/0.85 if unset. */
+    int maxDist = getenv("FOCAL_CAND_MAXDIST") ? atoi(getenv("FOCAL_CAND_MAXDIST")) : 90;
+    double maxRatio = getenv("FOCAL_CAND_MAXRATIO") ? atof(getenv("FOCAL_CAND_MAXRATIO")) : 0.85;
+    int ncand = find_candidates(A, na, B, nb, maxDist, maxRatio, &cand);
     *outCandidates = ncand;
 
     if (ncand < 3) { free(cand); *outInliers = 0; return 0.0f; }
