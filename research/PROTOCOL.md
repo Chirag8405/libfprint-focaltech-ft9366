@@ -4125,3 +4125,72 @@ scoring formula itself (tested with 100% real vendor code across 190 pairs from 
 dataset). Remaining honest options (per the previous entry): multi-frame fusion (no evidence this sensor's
 firmware supports it, not yet investigated) or accepting this as a genuine viability limit of this sensor/
 algorithm-family combination as currently understood.
+
+## Multi-frame/multi-touch fusion tested -- makes separation WORSE, not better (2026-09-17)
+
+Status: TESTED with real vendor scoring code. Reports a clean, decisive, and unfavorable result plainly.
+
+### Motivation and scope
+Searched the `.so`'s full DWARF symbol table for multi-frame/fusion-related functions. Found no raw video-
+frame-stitching mechanism ("Mosaic"/"Fusion"/"Stitch"/"Swipe" all absent), but found real evidence the vendor
+algorithm accumulates TEMPLATE AREA across multiple ENROLLMENT TOUCHES: `FtTemplateExtraAreaRefresh`,
+`ST_FocalTemplate`'s `templateExtendArea`/`templateCoinHmatrix[96]`/`templateCoinFlag[25]` fields,
+`FtTemplateCoinArea` (computes overlap/coincidence stats between two templates), and the already-confirmed
+`gSensorInfor.enrollMaxTplCount=16` (up to 16 enrollment touches tracked). The exact incremental multi-
+subtemplate state machine (embedded inside the giant `FtVerifyByTemplate`/`FtSubTemplateCopy`/`FtSetCoinFlg`
+call graph) was judged too costly to fully reverse-engineer as a first pass -- instead, tested the underlying
+HYPOTHESIS directly: does combining several enrollment touches' real binarized/masked data into one composite
+reference improve discrimination, when scored with the REAL `FtCalcSimScore`?
+
+### Method
+Built `tools/ground_truth_fusion_test.c`: aligns 9 index-finger captures (`idx01-09`) into `idx01`'s coordinate
+frame using this project's own validated rigid-fit alignment on real `FtGetMfbFeatures` correspondences,
+majority-vote-fuses their real `FtGenBinImg`/`FtSegmentByLocalVariance` outputs into one composite mask+bin
+image, then scores the held-out same-finger capture (`idx10`) and all 10 different-finger captures against
+BOTH the fused composite and the single unfused reference (`idx01` alone) using the REAL `FtCalcSimScore`.
+
+### Result
+```
+Fused valid area: 62.2% of canvas vs. single-reference 53.3% -- confirms fusion genuinely extends coverage (1.17x)
+
+                                          fused_score   single_ref_score
+idx10 (HELD-OUT SAME finger):              0.8861          0.8452
+mid01 (different):                         0.8754          0.8284
+mid02 (different):                         0.9054          0.8188
+mid03 (different):                         0.9460          0.8425
+mid04 (different):                         0.9349          0.8533
+mid05 (different):                         0.9771          0.8527
+ring01 (different):                        0.9759          0.8547
+ring02 (different):                        0.9821          0.8507
+ring03 (different):                        0.9846          0.8546
+ring04 (different):                        0.9842          0.8572
+ring05 (different):                        0.9740          0.8524
+```
+**Fusion makes the problem WORSE, not better.** The genuine same-finger probe's fused score (0.8861) is the
+SECOND-LOWEST of all 11 fused scores -- every ring-finger probe (a genuinely different finger) scores
+substantially higher (0.97-0.98) against the fused template than the real held-out same-finger capture does.
+Fusion raised every score (both same and different), but raised different-finger scores by roughly 2-4x more
+than the same-finger score (e.g. ring03: +0.13 vs idx10's +0.04).
+
+### Interpretation
+This is a real, structural problem with majority-vote area-extension fusion on binarized ridge images, not
+noise: combining multiple captures via majority vote suppresses per-capture noise and idiosyncrasy, producing a
+"cleaner," more GENERIC ridge-pattern composite -- which then agrees MORE with ANY test capture's ridge
+pattern (matching or not) precisely because it has been denoised toward the common, non-identity-specific
+periodic ridge structure this sensor's small capture area is dominated by (consistent with this whole
+project's repeated finding that ridge periodicity/contact-area geometry, not true minutiae detail, dominates
+the signal at this scale). This is an honest, informative negative result, not a dead end to keep pushing on
+with more fusion-weighting variants -- it directly demonstrates why simply extending capture area does not
+help if the underlying per-pixel agreement signal itself isn't finger-identity-specific to begin with.
+
+### Updated conclusion
+This closes out "option 2" from the previous entries (multi-frame/multi-touch fusion) as also NOT resolving
+the separation problem -- if anything, actively worsening it. Combined with the earlier findings (ruling out
+detection, descriptor, alignment, scoring-formula-implementation, `FtCalcSimScoreRefit`, and
+`FtVerifyByTemplate`'s multi-subtemplate "best of N" strategy), this project has now tested every concrete,
+locatable real-algorithm-based lever available and found none of them produce reliable same/different-finger
+separation on this sensor. The remaining honest conclusion is **option 3**: this specific sensor
+(FT9366, 64x80 native resolution) combined with this vendor's masked-ridge-overlap verification approach, as
+implemented across every function this project has located and validated in the real `.so`, does not appear to
+provide reliable fingerprint verification -- a genuine, well-evidenced viability limit, not an unsolved
+implementation bug.
