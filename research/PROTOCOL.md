@@ -1038,3 +1038,68 @@ logic elsewhere in `fdt_base_Stable_Update`, not yet traced beyond this point).
 Trace `fw9366_fdt_base_Min_Updata` (the last untraced function directly in `fdt_base_Stable_Update`'s
 sequence) -- may resolve which of the two possibilities above is correct, and/or reveal what "Min Update"
 does when the fail-check result is -1 (e.g. does the caller check this return value and take a different path).
+
+## MILESTONE: fw9366_calculate_crc algorithm fully resolved (2026-09-16)
+
+Status: CONFIRMED (static disassembly + verified against standard CRC-16/CCITT-FALSE test vector)
+
+### fw9366_calculate_crc(data, len) -- pure local, no I/O
+
+This is the **standard CRC-16/CCITT-FALSE algorithm**: polynomial `0x1021`, initial value `0xffff`, MSB-first
+bit order, no input/output reflection, no final XOR.
+
+```
+crc = 0xffff
+for each byte in data:
+  cur = byte << 8
+  for bit in 0..7:
+    xor_val = crc ^ cur
+    crc <<= 1; cur <<= 1
+    if (xor_val & 0x8000): crc ^= 0x1021
+return crc
+```
+
+**Verified correct**, not just pattern-matched: computed against the standard CRC-16/CCITT-FALSE test vector
+("123456789" -> expected `0x29b1`) -- got `0x29b1` exactly. This directly answers the "exact CRC
+algorithm/polynomial/seed" question from this session's brief.
+
+### fw9366_fdt_base_Min_Updata(data) -- pure local, no I/O at all
+
+Confirmed via call-site check: 2 call sites, one in our confirmed chain (`fdt_base_Stable_Update`), the other
+in an unrelated function (`fw9366_fdt_base_Update`, no "Stable" -- not reachable from anything traced this
+session, likely part of the later capture/enroll flow, not chased now).
+
+```
+block = fdt_block() = 4
+for i in 0..block-1:
+  val = data[i]
+  data[i] = (val <= 0x1e) ? 0 : val - 0x1e   -- baseline subtraction, in place
+for i in 0..block-1:
+  val = data[i]   -- the adjusted value
+  REG9366[0x92+2i] = val   -- three separate copies of the same adjusted value,
+  REG9366[0xa6+2i] = val      confirmed via disassembly (not assumed) -- all three
+  REG9366[0xba+2i] = val      write blocks read the SAME data[i] and write the SAME val
+crc1 = calculate_crc(&REG9366[0xba], 8); REG9366[0xca] = crc1
+crc2 = calculate_crc(&REG9366[0xa6], 8); REG9366[0xb6] = crc2
+```
+
+Since both CRC'd regions are confirmed to hold identical copies of the adjusted frame data, both CRCs are
+computed over the same effective 8 bytes.
+
+### Live-data test (pure logic, no new hardware I/O needed -- function has none)
+
+Run directly against this session's actual captured `frame_buf` (all zeros -> all adjusted values also 0
+since 0 <= 30):
+
+```
+adjusted = [0, 0, 0, 0]
+crc1 = crc2 = 0x313e
+```
+
+Both match hand-derived predictions exactly.
+
+### Next concrete action
+This completes `fw9366_fdt_base_Stable_Update`'s entire direct call list (`fdt_block`, `fdt_AutoSDacUpdate`,
+`fdt_manual_start`, `fdt_get_a_frame_data`, `fw9392_fdt_base_fail_check`, `fdt_base_Min_Updata` -- all now
+traced). Next: `fw9366_img_base_Update` (the second direct child of `fw9366_Update_Base`, not yet started --
+contains `fw9366_img_data_get`, `find_max_min_avg_1218`, and its own `fw9366_AutoSDacUpdate`).
