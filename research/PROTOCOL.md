@@ -3106,3 +3106,32 @@ values, diff, localize precisely) to the ORIENTATION ASSIGNMENT stage specifical
 truth for a keypoint's orientation histogram or the octave/interval the real algorithm assigns it, and compare
 against `calc_feature_oris`'s own output for the same detected position, rather than continuing to test the
 full pipeline's aggregate behavior.
+
+## Further precise localization: octave/interval assignment implicated, not orientation precision (2026-09-16)
+
+Status: CONFIRMED via extremely tight position+orientation matches. Checked 12 keypoint pairs where OUR
+position agrees with a real keypoint to <0.25px AND our orientation agrees to <0.05rad (several agreeing to
+<0.01rad, one to 0.0009rad -- as close as floating-point/detection noise allows). Even at this precision,
+Hamming distances vary wildly and unpredictably: 49, 75, 91, 104, 128, 137, 165, 173, 176, 181, 184, 215 --
+some good, most bad, no correlation with how tight the position/orientation match is (e.g. the single BEST
+orientation match, doa=0.0009rad, gives hamming=75 -- decent but not excellent; the WORST hamming=215 pair has
+doa=0.0082rad, also very tight).
+
+This rules out remaining orientation imprecision as the cause (orientation is sometimes matched to within
+0.001rad and still gives mediocre Hamming) and points specifically at **octave/interval assignment**: since
+`compute_binary_descriptor` samples from `gauss_pyr[f->octv][f->intvl]`, if our own keypoint's assigned octave/
+interval differs from what the real algorithm assigned for the same physical point (even though the FINAL x/y/
+ori all agree, since those are normalized back to a common coordinate space regardless of source octave), the
+sampled pixel data comes from a different blur level entirely, corrupting the descriptor independent of how
+precisely position/orientation match. This is consistent with and explains the full-pipeline test's persistent
+failure despite both confirmed descriptor-logic fixes.
+
+### Honest status and recommended next step
+Two real bugs in `compute_binary_descriptor` are confirmed fixed (ori+PI rotation, comparison operator). A
+third, distinct issue remains: octave/interval assignment consistency between this reimplementation and the
+real algorithm, not yet directly diagnosed (would need ground truth on which octave/interval the real
+algorithm assigns specific keypoints -- not yet extracted, unlike the position/orientation/descriptor ground
+truth already in hand). Next step for a future session: extract that specific ground truth (likely via the
+same `FtMfbDescriptors` breakpoint technique, reading the keypoint's octave/interval fields directly if
+accessible, or by testing our OWN descriptor computation across ALL candidate octaves for a known keypoint and
+checking which one's resulting descriptor best matches the real one -- a direct, decisive test not yet run).
