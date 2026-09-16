@@ -1596,3 +1596,78 @@ minutiae extraction instead of raw image correlation, not incidentally.
 ### Next: STEP 3 -- evaluate minutiae-based matching
 Per instructions, not tweaking correlation further. Proceeding to check whether libfprint itself exposes
 reusable minutiae extraction/matching primitives before writing anything from scratch.
+
+## STEP 3: real minutiae-based matching evaluated -- libfprint's own NBIS pipeline tested directly (2026-09-16)
+
+Per this session's pre-set instruction: "check whether libfprint itself exposes reusable minutiae
+extraction/matching primitives... before writing anything from scratch." It does: `libfprint/nbis/` bundles
+NIST's MINDTCT (minutiae extraction, `get_minutiae()`) and Bozorth3 (minutiae matching,
+`bozorth_probe_init()`/`bozorth_to_gallery()`), already built as `build/libfprint/libnbis.a` in the upstream
+libfprint checkout at `~/Desktop/libfprint`. Every FpImageDevice-based driver in libfprint uses this pipeline
+automatically via `fp_image_detect_minutiae()` (libfprint/fp-image.c) and `fpi_print_bz3_match()`
+(libfprint/fpi-print.c) -- no driver writes its own minutiae code. This is a real, production, reusable
+primitive, not something to build from scratch.
+
+### Test performed
+Wrote `tools/nbis_minutiae_test.c`, a standalone tool that links directly against `libnbis.a` and replicates
+libfprint's own call sequence exactly (`get_minutiae()` with the real default `g_lfsparms_V2` params, then
+`minutiae_to_xyt()` + `bozorth_probe_init()`/`bozorth_to_gallery()`, copied verbatim from
+`libfprint/fpi-print.c`), run directly against the same 10 real captures from the calibrated set above (6
+same-finger, 4 different-finger). Raw 16-bit BE pixel values were normalized to 8-bit via 1st/99th-percentile
+linear scaling (real observed raw pixel range on this sensor: ~0-2022, not full 16-bit). Resolution passed to
+MINDTCT: assumed 500 DPI (19.685 px/mm) -- the de-facto standard for fingerprint sensors (same constant
+`libfprint/drivers/secugen.c` uses) -- since this sensor's true physical size/DPI is NOT independently
+confirmed.
+
+### Result: MINDTCT finds far too few minutiae per capture for Bozorth3 to ever produce a match
+```
+same1.raw: 1 minutiae   same4.raw: 1 minutiae   diff1.raw: 1 minutiae
+same2.raw: 1 minutiae   same5.raw: 5 minutiae   diff2.raw: 1 minutiae
+same3.raw: 3 minutiae   same6.raw: 2 minutiae   diff3.raw: 1 minutiae
+                                                  diff4.raw: 1 minutiae
+```
+Reliability scores on the few minutiae found are very low (0.06-0.16; typical real MINDTCT output on
+standard-sized fingerprint images has many minutiae with reliability 0.3-0.7+).
+
+All 45 pairwise Bozorth3 scores (same-finger, same-vs-different, different-vs-different alike) are exactly
+**0** -- reported plainly, not rounded up. This is not "barely failing to match" -- it's a floor effect.
+Bozorth3 needs multiple corresponding minutiae with consistent geometric relationships between two prints to
+produce any nonzero score at all; with only 1-5 minutiae total per capture, there usually aren't enough points
+to even attempt correspondence, regardless of whether the two captures are the same finger or not. The
+same-finger and different-finger cases are indistinguishable here for a trivial reason (no signal at all to
+compare), not because a real discrimination attempt failed.
+
+### Root cause: structural resolution mismatch, not a tunable parameter
+MINDTCT's default block/window geometry (`MAP_BLOCKSIZE_V2`=8px, `MAP_WINDOWSIZE_V2`=24px sliding window for
+ridge-flow direction estimation) is designed for images with hundreds of analysis blocks per axis (standard
+NIST/FBI fingerprint images are typically 500x500px+ at 500 DPI). This sensor's 64x80px capture yields only a
+handful of blocks with a full valid analysis window, especially near the edges where the 24px window doesn't
+fit. This directly explains the observed 1-5 minutiae ceiling -- it is a structural property of the image
+size relative to the algorithm's design assumptions, not a quality-threshold setting that can be relaxed away.
+Lowering `MIN_CONTRAST_DELTA`/`PERCENTILE_MIN_MAX` etc. was considered but not expected to help materially,
+since the limiting factor is the number of valid analysis *locations*, not per-location acceptance thresholds
+-- not pursued further as a quick fix, per "don't keep tweaking parameters" guidance, since the mismatch is
+structural.
+
+### Honest conclusion
+Stock NBIS/MINDTCT, as bundled in libfprint and used by every existing image-based driver, **does not work on
+this sensor's native 64x80 single-shot captures** -- not a "needs tuning" result, a "wrong tool for this
+resolution" result. This also retroactively explains why the vendor's own proprietary matcher
+(`FtVerifyByTemplate`, confirmed host-side in STEP 1) almost certainly does NOT use generic minutiae
+extraction either -- it was very likely custom-built/tuned specifically for this sensor's tiny native
+resolution, which is presumably exactly why FocalTech didn't just reuse a stock algorithm.
+
+This is a genuine fork in project direction with substantially different scope per option -- reporting to the
+user for a decision rather than unilaterally committing to one:
+1. Reverse-engineer the vendor's own proprietary matching algorithm (`FtVerifyByTemplate`/template format) --
+   leverages an algorithm already proven to work at this exact resolution, but is a substantial new static
+   RE sub-project on top of the wire-protocol work already done.
+2. Multi-frame capture + stitching (analogous to how libfprint's `elan`/`elanspi` swipe drivers assemble many
+   small frames into one larger composite image) to produce a larger effective image with enough real detail
+   for stock MINDTCT to work on -- requires new capture-side design (frame registration/stitching), not just
+   parameter tuning.
+3. Design a small-area-sensor-specific matching approach (multiple enrollment captures per finger at
+   different positions, direct patch correlation with more sophisticated preprocessing than the NCC approach
+   already tried and shown not to separate finger identity) -- closer to what real small capacitive sensors
+   in phones/laptops actually do, since minutiae-based approaches are known in the fingerprint literature to
+   fail on small-area sensors for exactly the reason observed here.

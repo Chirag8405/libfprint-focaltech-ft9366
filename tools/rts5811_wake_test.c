@@ -1172,7 +1172,16 @@ int main(void)
      * explicitly disabled via NO_CALIBRATION=1 (kept for quick
      * before/after comparison during this session's own testing). */
     static unsigned char image_buf[10240];
-    if (getenv("NO_CALIBRATION") == NULL) {
+    const char *fixed_dac_str = getenv("FIXED_DAC");
+    if (fixed_dac_str != NULL) {
+        /* Use a locked, pre-determined DAC value instead of calibrating
+         * fresh each run -- necessary for a fair same-gain comparison set:
+         * calibration adapts to whatever is on the sensor at that moment,
+         * so calibrating separately for baseline vs. each touch would give
+         * different gain levels and make background subtraction invalid. */
+        g_dac_value = (unsigned char)strtol(fixed_dac_str, NULL, 0);
+        printf("\n== FIXED_DAC set, using locked dac=0x%02x (no calibration this run) ==\n", g_dac_value);
+    } else if (getenv("NO_CALIBRATION") == NULL) {
         printf("\n== running DAC calibration to convergence (starting dac=0x%02x) ==\n", g_dac_value);
         run_dac_calibration(h, image_buf, sizeof(image_buf), 15);
         printf("== calibration finished, final dac=0x%02x ==\n", g_dac_value);
