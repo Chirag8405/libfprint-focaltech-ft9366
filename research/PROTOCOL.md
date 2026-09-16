@@ -1730,3 +1730,10 @@ loaded either way.
 **This directly conflicts with this project's original goal, stated at the very start of the session: "zero
 runtime dependency on any proprietary binary."** Not proceeding with direct-offset-calling as the shipped
 architecture without checking with the user first. Flagged as a fork rather than assumed.
+
+### Decision: reimplement cleanly, preserve zero-dependency goal (2026-09-16)
+User chose to use the now-known struct layouts/function signatures to guide a faithful from-scratch
+reimplementation, rather than calling into the real .so functions (even for quick validation) or shipping
+against them directly. This preserves the original zero-runtime-dependency goal stated at the start of the
+project. Proceeding to map FtGetTemplate's (feature extraction) and FtVerifyTwoTemplate's (matching) internal
+call structure next, using DWARF-recovered function/variable names, before any linear reading.
