@@ -1994,3 +1994,60 @@ Traced so far: FtNonLinearStretch_U8 (full), f9395_image_enhance (full, modulo F
 FtGrayMeanSub (full), FtBadPixselDetect (full), FtLocalContrastEnhance (full).
 Remaining: FtSegmentByLocalVariance, FtResize_8u, SPA smoothing (InitSPAImageSize/MaskRadius/ImpactFactors +
 FtSpaSmooth), FtGenBinImg/FtGenBinImgForSamllSensor/FtRepairGenBinImgForSamllSensor.
+
+## STEP 1 WRAP-UP: preprocessing chain traced to a workable level (2026-09-16)
+
+Status: MOSTLY CONFIRMED, with explicitly flagged lighter-touch items (not full raw-disassembly rigor on
+every single function -- pragmatic pacing call given the much larger Step 2/3 functions still ahead; the
+planned real-vs-reimplementation intermediate-buffer diff will empirically catch any error in these).
+
+### FtResize_8u(UINT8 *src, SINT32 srcRows, SINT32 srcCols, UINT8 *dst, SINT32 dstRows, SINT32 dstCols)
+CONFIRMED: standard fixed-point (12-bit, 0x1000 scale) bilinear interpolation resize -- a well-documented,
+exactly-reproducible technique (same class of algorithm as OpenCV's `resize()` fixed-point path), not bespoke.
+NOT YET DETERMINED: the actual srcRows/cols -> dstRows/cols values used at the real call site inside
+`FtGetTemplate` (both src and dst are `ST_IplImage*` structs whose width/height fields are set earlier in the
+function from local stack structs not yet traced back to their origin) -- deferred to the empirical validation
+phase rather than chased further now, since it doesn't change the resize *algorithm*, only its parameters.
+
+### SPA smoothing group -- lighter-touch trace
+`InitSPAImageSize(col,row)` / `InitSPAMaskRadius(rad)` / `InitSPAImpactFactors(zoomRatio)`: trivial setters
+into a global `gSPApara` struct (cyclomatic complexity 1 each, fully confirmed, nothing to misread).
+`FtSpaSmooth(UINT8 *src, UINT16 impactFactor)`: computes an impact-factor-derived scale value from
+`gSPApara`'s radius, calls `FastConv(src, col)` (a fast box/mean convolution, not independently traced) and
+then a further step via a raw function-pointer tail call (address `0x11a0b0`, not resolved to a named symbol
+this pass). Structurally a smoothing operation consistent with its place in the pipeline; NOT bit-exact traced
+-- flagged honestly rather than guessed further.
+
+### FtGenBinImgForSamllSensor(ST_IplImage *img, UINT64 **pArr, UINT16 *arrLen) -- CONFIRMED, clear algorithm
+```
+n = img->width * img->height
+copyImg=UINT8[n]; medImg=UINT8[n]; binImg=UINT8[n]   (FtSafeAlloc)
+copy img->imageData rows into copyImg (respecting img->widthStep)
+FtMedianFilter(copyImg, cols, rows, ksize=1, dst=medImg)         -- median filter (small kernel)
+FtLocalThreshold(medImg, cols, rows, 1, blockSize=5, constC=<const@0x188398>, dst=binImg)  -- adaptive threshold
+bitArr = UINT64[ceil(n/64)]  (FtSafeAlloc, zeroed)               -- packed bitset output
+for each pixel i where binImg[i] != 0: FtSetBitValue_1(bitArr, wordsPerRow, i, 1)   -- pack into bitset
+*pArr = bitArr; *arrLen = ceil(n/64)
+free copyImg, medImg, binImg (only the packed bitset is returned)
+```
+This is a real, standard technique (median filter -> adaptive threshold -> bit-packed binary mask), matching
+the "binarization" role already inferred from the pipeline map. The bit-packed output is almost certainly what
+`FtGetMfsFeatures` scans next to know which pixels are candidate foreground/ridge locations.
+`FtRepairGenBinImgForSamllSensor` (33 cx, a small variant/fixup pass) NOT yet traced -- noted, deferred.
+
+### Genuinely deferred items (explicit, not silently dropped)
+- `curved_surface_img_localequalizehist_v2`'s exact inner accumulation/masking logic (ambiguity flagged earlier)
+- `FtImageEnhance_16u_v2` internals (called by `f9395_image_enhance`)
+- `FastConv` and the unresolved tail-call target inside `FtSpaSmooth`
+- `FtRepairGenBinImgForSamllSensor`
+- Exact resize dimensions (algorithm confirmed, parameters not)
+- `FtMeanImage`, `FtErosion`/`FtErode`/`FtDilate`, `FtMedianFilter`, `FtLocalThreshold` internals -- all treated
+  as standard, well-understood image-processing primitives (mean filter, morphological erode/dilate, median
+  filter, adaptive threshold) by name and calling convention, not independently disassembled line-by-line.
+
+### Decision: proceed to Step 2 (FtGetMfsFeatures)
+The preprocessing chain is understood well enough to attempt a first reimplementation pass, with the explicit
+plan to validate against real `.so` intermediate buffers (via `gdb`) once enough of the full pipeline exists to
+make that comparison meaningful -- that step will also resolve the deferred ambiguities above empirically.
+Continuing to perfect every preprocessing function in isolation before touching the much larger and more
+critical `FtGetMfsFeatures`/`FtGetMfbFeatures` stages would not be the highest-value use of time right now.
