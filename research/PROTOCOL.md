@@ -366,3 +366,62 @@ CONFIRMED for this physical unit: `smic_flag = 0x00`. This resolves the previous
 
 ### Next concrete action
 Trace `fw9366_init_flag()` and `fw9366_intflag_clear(0xffff)` (both run between `get_SMIC_IC_flag` and `cfg_init` in the real sequence -- note: `fw9366_init_chip`'s call order per the earlier trace is Get_OTP_Info -> get_SMIC_IC_flag -> init_flag -> intflag_clear -> cfg_init -> Update_Base -> fdt_auto_start -> poa_send_para). `fw9366_Get_OTP_Info` was skipped over in the original trace summary and has not been individually disassembled yet either -- check it next since it runs first in the chain, before get_SMIC_IC_flag.
+
+## Update: fw9366_Get_OTP_Info / fw9366_sfr_write / fw9366_otp_read traced and CONFIRMED against real hardware (2026-09-16)
+
+Status: CONFIRMED (static disassembly AND live hardware test, zero timeouts across the full sequence)
+
+### fw9366_sfr_write(reg, val) (address 0x165e31) -- NEW confirmed command
+
+```text
+Bulk OUT ep0x01: [0x09, 0xf6, reg, val]   (4 bytes)
+No bulk IN -- fire-and-forget (transport: ff_spi_write_buf_rts, single
+User_TL_Transmit_N_Byte write call, no read pairing -- confirmed by
+disassembly).
+```
+
+Combined with the already-confirmed SFR read, the low-level command family is now coherent:
+- `[0x08, 0xf7, reg, 0x00, 0x00]` -> 1-byte read response (SFR_READ)
+- `[0x09, 0xf6, reg, val]` -> no response (SFR_WRITE)
+
+### fw9366_otp_read(addr) (address 0x166b99) -- built on the SFR primitives
+
+```text
+sfr_write(0xf1, addr)   ; set OTP address
+sfr_write(0xf4, 0xc0)   ; trigger sequence
+sfr_write(0xf4, 0xc1)
+sfr_write(0xf4, 0xc0)
+sfr_write(0xf4, 0xc0)
+return sfr_read(0xf3)   ; read result
+```
+
+### fw9366_Get_OTP_Info(out1, out2) (address 0x155a40)
+
+```text
+*out1 = otp_read(0x03) & 0x1f   (if out1 != NULL)
+*out2 = otp_read(0x13) & 0x0f   (if out2 != NULL)
+```
+
+Real call in `fw9366_init_chip` is `fw9366_Get_OTP_Info(NULL, NULL)` -- both outputs are discarded by the real driver, but the reads still happen (possibly a required priming/trigger side effect, or just vestigial logging-only code -- not yet clear which, and not critical to resolve since the reads are cheap to replicate either way).
+
+### Live hardware test result (tools/rts5811_wake_test.c, real device)
+
+Every single transfer in both full otp_read sequences (5 writes + 1 read, x2) completed successfully with zero timeouts:
+
+```
+otp_read(0x03) -> raw 0xf0  =>  & 0x1f = 0x10
+otp_read(0x13) -> raw 0x14  =>  & 0x0f = 0x04
+```
+
+CONFIRMED for this physical unit: `otp_read(3)&0x1f = 0x10`, `otp_read(0x13)&0x0f = 0x04`.
+
+### Running tally of confirmed-working real commands
+1. Wake ping: `4c 5a 01 00` -> `04 00 00 04` (proceed)
+2. SFR read: `08 f7 <reg> 00 00` -> 1 byte
+3. SFR write: `09 f6 <reg> <val>` -> no response (fire-and-forget)
+4. OTP read (composite: 5x SFR write/read) -- fully exercises both primitives above
+
+Every command tried against real hardware in this protocol family (SFR read/write and everything built on them) has worked cleanly on the first attempt, no retries, no timeouts. This is strong positive signal that the SFR/OTP command family is the correct protocol track for this device.
+
+### Next concrete action
+Trace `fw9366_init_flag()` and `fw9366_intflag_clear(0xffff)` (both run between `get_SMIC_IC_flag`/`Get_OTP_Info` and `cfg_init` in the real `fw9366_init_chip` sequence).

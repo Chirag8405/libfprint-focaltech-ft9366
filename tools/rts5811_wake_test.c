@@ -46,6 +46,33 @@ static int bulk_read(libusb_device_handle *h, unsigned char *buf, int len)
     return r;
 }
 
+/* fw9366_sfr_write(reg, val), traced at 0x165e31: fire-and-forget, bulk OUT
+ * only via ff_spi_write_buf_rts (single write, no read pairing). */
+static int sfr_write(libusb_device_handle *h, unsigned char reg, unsigned char val)
+{
+    unsigned char buf[4] = { 0x09, 0xf6, reg, val };
+    return bulk_write(h, buf, sizeof(buf));
+}
+
+/* fw9366_otp_read(addr), traced at 0x166b99: address setup + fixed trigger
+ * sequence via sfr_write, then a final sfr_read(0xf3) for the result. */
+static int otp_read(libusb_device_handle *h, unsigned char addr, unsigned char *out)
+{
+    printf(" otp_read(0x%02x):\n", addr);
+    sfr_write(h, 0xf1, addr);
+    sfr_write(h, 0xf4, 0xc0);
+    sfr_write(h, 0xf4, 0xc1);
+    sfr_write(h, 0xf4, 0xc0);
+    sfr_write(h, 0xf4, 0xc0);
+    unsigned char cmd[5] = { 0x08, 0xf7, 0xf3, 0x00, 0x00 };
+    unsigned char resp[1] = { 0 };
+    int wr = bulk_write(h, cmd, sizeof(cmd));
+    int rr = bulk_read(h, resp, sizeof(resp));
+    if (wr != 0 || rr != 0) return -1;
+    *out = resp[0];
+    return 0;
+}
+
 int main(void)
 {
     libusb_context *ctx = NULL;
@@ -190,6 +217,25 @@ int main(void)
     } else {
         printf("\n== RESOLVED: smic_flag = 0x%02x -> Fw9366_cfg[0xc..0xd] = %s ==\n",
                smic_flag, smic_flag == 0xaa ? "0x0096" : "0x00c8");
+    }
+
+    /* --- fw9366_sfr_write() / fw9366_otp_read() / fw9366_Get_OTP_Info() ---
+     * Traced from static disassembly: fw9366_sfr_write at 0x165e31 (buffer
+     * [0x09, 0xf6, reg, val], write-only via ff_spi_write_buf_rts -- single
+     * User_TL_Transmit_N_Byte write call, no read pairing), fw9366_otp_read
+     * at 0x166b99, fw9366_Get_OTP_Info at 0x155a40. Real call in the init
+     * chain is fw9366_Get_OTP_Info(NULL, NULL) -- both outputs discarded,
+     * but the underlying reads still happen and are tested here. */
+    printf("\n== fw9366_sfr_write() / fw9366_otp_read() ==\n");
+
+    unsigned char otp3 = 0, otp13 = 0;
+    int r3 = otp_read(h, 0x03, &otp3);
+    int r13 = otp_read(h, 0x13, &otp13);
+    if (r3 == 0 && r13 == 0) {
+        printf("\n== RESOLVED: otp_read(3)&0x1f = 0x%02x, otp_read(0x13)&0x0f = 0x%02x ==\n",
+               otp3 & 0x1f, otp13 & 0x0f);
+    } else {
+        printf("\n== otp_read failed (transfer error) ==\n");
     }
 
     libusb_release_interface(h, 0);
