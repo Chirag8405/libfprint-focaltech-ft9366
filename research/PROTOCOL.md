@@ -2160,3 +2160,30 @@ where no customization is evident, (b) precisely nailing the two confirmed param
 rather than disassembling every stock-equivalent function from zero as if its behavior were unknown. This
 meaningfully changes the Step 2 time estimate for the better versus the pre-discovery "weeks" framing, though
 the two FocalTech-specific functions and the descriptor-split question still require genuine RE.
+
+## Update: small FtGetMfsFeatures helper functions confirmed against OpenSIFT reference (2026-09-16)
+
+Status: CONFIRMED via WebFetch of OpenSIFT's actual public source (`src/sift.c`) cross-checked against real
+disassembly/decompile output.
+
+- `FtGetKpNumMode4()` -- trivial: calls `FtSensorTypeGet()` (return value discarded) and returns a fixed
+  constant `0xa0` = 160. No OpenSIFT equivalent; this is FocalTech's max-keypoint-count cap for this sensor
+  mode, confirmed as a plain fixed value, not computed.
+- `FtCalcFeatureScales(ST_Seq *features, FP32 sigma, SINT32 intvls)` -- structurally matches OpenSIFT's
+  `calc_feature_scales`: for each feature, `scl = sigma * pow(2.0, someIntervalField/intvls)`. Only ONE scale
+  field is written per feature (not two, unlike OpenSIFT's separate `feat->scl`/`ddata->scl_octv`) -- plausible
+  explanation: FocalTech's internal per-feature record folds octave scaling into the interval field differently
+  than OpenSIFT's split representation; not fully disambiguated, flagged rather than asserted.
+- `FtAdjustForImgDbl(ST_Seq *features)` -- matches OpenSIFT's `adjust_for_img_dbl`: multiplies each feature's
+  x,y by a confirmed exact constant of **0.5** (extracted from `.rodata`, not estimated). Only x,y are scaled
+  here (not a separate `scl`/`img_pt` pair like OpenSIFT, consistent with a more compact internal record used
+  during detection before conversion to the final 44-byte `ST_Feature`). **This function's mere presence and
+  active use of a 0.5 halving constant is itself strong indirect confirmation that `imgDbl=1` (image doubling)
+  is genuinely active in the real pipeline** -- consistent with `FtResize_8u` running immediately before this
+  stage (per the earlier-mapped pipeline), resolving that previously-open question with reasonable confidence
+  without needing to hand-trace the 9-field stack-push struct construction.
+
+### Next
+`FtScaleSpaceExtrema` (89 cx, 139 bbs -- the core detection loop, directly uses `contrThr`/`curvThr`) and
+`FtInValidPixelSet` (35 cx -- FocalTech-specific, likely integrates the earlier-traced segmentation/bad-pixel
+masks) are next, being the two highest-value remaining pieces in this stage.
