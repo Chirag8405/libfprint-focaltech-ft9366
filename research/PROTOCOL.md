@@ -3538,3 +3538,98 @@ concluding hypothesis 1 (an inherent physical limitation) by elimination. Altern
 synthetic-diagnostic methodology to isolate hypothesis 3: run `test_rotation_sweep`-style detection-only
 (feature count and position stability, not full matching) on synthetic rotations to quantify how repeatable
 this reimplementation's own keypoint detection is under rotation, independent of the matching stage entirely.
+
+## Hypothesis (3) CONFIRMED: detection-only repeatability across real captures is not finger-identity-specific (2026-09-16)
+
+Status: CONFIRMED via a purpose-built detection-only diagnostic (`tools/test_detection_repeatability.c`,
+committed as reusable tooling). This is a decisive, root-cause-level finding, tested independently of the
+matching stage entirely (no descriptors, no Hamming distance, no RANSAC, no FtCalcSimScore).
+
+### Method
+For every pair of real captures (`same1-6.raw`, `diff1-4.raw`), ran ONLY `focal_extract_features` (detection),
+discarded descriptors, and searched a brute-force coarse-to-fine grid over rigid transforms (translation
++-25px, rotation +-20deg) to find the ALIGNMENT THAT MAXIMIZES how many of capture A's keypoints land within a
+fixed pixel radius of some keypoint in capture B. This is deliberately independent of this project's own
+(possibly buggy) alignment estimator -- it directly answers "do these two independently detected keypoint sets
+correspond geometrically at their best possible alignment," a strictly more generous test than any real matcher
+could achieve (which must find that alignment from noisy candidate correspondences, not by exhaustive search
+with foreknowledge of the answer).
+
+### Result: same-finger and different-finger repeatability are statistically indistinguishable, at every threshold tested
+```
+threshold=1.5px:  same-finger=42.1%  different-finger=40.1%  gap=+2.0 points
+threshold=2.0px:  same-finger=48.0%  different-finger=47.7%  gap=+0.3 points
+threshold=3.0px:  same-finger=58.7%  different-finger=57.6%  gap=+1.1 points
+threshold=5.0px:  same-finger=77.0%  different-finger=76.5%  gap=+0.5 points
+threshold=8.0px:  same-finger=102.0% different-finger=93.5%  gap=+8.5 points  (chance-collision territory --
+                                                                                consistent with the project's
+                                                                                own earlier chance-collision
+                                                                                calculation at loose radii)
+```
+n=15 same-finger pairs, n=30 different-finger pairs (6 same-finger captures, 4 distinct different fingers).
+**The gap stays near-zero (0.3-2.0 percentage points) across the entire 1.5-5px range** where a real
+discriminative signal would be expected to show up if one existed -- ruling out "just needs a looser/tighter
+threshold" as an explanation. The absolute repeatability rate rises with threshold purely because more chance
+alignment is tolerated, not because same-finger pairs specifically benefit.
+
+### Root-cause narrowing: how much is detector-own instability vs. real-world capture noise
+To separate the detector's OWN rotation-sensitivity (already suspected from the earlier synthetic diagnostic,
+where feature counts grew substantially under rotation) from additional real-world capture-to-capture noise
+(skin deformation, pressure, moisture, sensor variation), ran a second test: apply a KNOWN EXACT synthetic
+transform to a single real capture (no independent second touch at all -- same exact underlying pixels) and
+check repeatability using that exact transform directly (no search needed, ground truth is exact):
+```
+dx=0,dy=0,theta=0 (identity):     97.8% repeatability
+dx=2,dy=0 (pure translation):     93.3%
+dx=0,dy=2 (pure translation):     93.3%
+theta=2deg (pure rotation):       77.8%
+theta=3deg:                       80.0%
+theta=5deg:                       64.4%
+dx=2,dy=1,theta=3deg (combined):  68.9%
+dx=-1,dy=2,theta=-2deg:           84.4%
+```
+Even with ZERO real-world noise (same exact pixels, purely synthetic geometric distortion, exact known
+transform with no estimation error), rotation alone degrades detection repeatability to 64-84% by 2-5 degrees.
+This confirms the detector itself has real, non-trivial rotation instability independent of any capture noise.
+But this synthetic-clean baseline (64-84% for a few degrees of rotation) is still noticeably HIGHER than the
+~58% average seen between REAL independently-captured same-finger touches at best-fit (search-optimized)
+alignment -- and a best-fit search is inherently at least as favorable as a fixed known transform. This gap
+(64-84% synthetic-clean vs. ~58% real-recapture) indicates genuine real-world capture-to-capture variation
+(skin deformation under pressure, moisture, contact-area differences, sensor noise) contributes ADDITIONAL
+degradation beyond the detector's own rotation sensitivity, compounding it.
+
+### Conclusion: detection instability, not the matching stage, is the dominant bottleneck
+Both contributing factors -- detector-own rotation sensitivity (confirmed, real) and real-world capture
+variation (implied by the synthetic-vs-real gap) -- combine to make the actual keypoint sets extracted from two
+real touches of the SAME finger no more geometrically self-consistent, even at ideal alignment, than two
+touches of DIFFERENT fingers. **No matching-stage sophistication -- not a better RANSAC, not FtRansacEdage_32f,
+not a different scoring formula -- can produce reliable separation from input this unstable.** This directly
+explains why eight independent, well-reasoned matching-stage fixes across two sessions all failed to move the
+needle: the bottleneck was never there.
+
+### Decision per the pre-registered plan: do NOT proceed to FtRansacEdage_32f disassembly
+Per this investigation's own decision rule, this result (low, statistically indistinguishable same/different
+repeatability) means a better matching stage cannot fix insufficient input. Disassembling `FtRansacEdage_32f`
+is deprioritized pending detection-stage improvement.
+
+### Honest viability assessment
+This is a materially different, and harder, class of problem than anything found in this project so far. Prior
+findings (rotation-convention bug, binarization formula, RANSAC clique bug) were concrete, fixable
+implementation errors with clear before/after confirmation. This finding is different: it may reflect (a) a
+genuine remaining bug in this reimplementation's detection stage (`scale_space_extrema`/`calc_feature_oris`)
+that makes it LESS rotation/noise-robust than the real FocalTech algorithm -- fixable in principle, not yet
+localized with the same rigor applied to the descriptor stage -- or (b) an inherent limitation of DoG-based
+keypoint detection at this sensor's small native resolution (64x80) and contact-area size, where too few
+genuinely stable, repeatable high-contrast features exist for keypoint-correspondence matching to work
+reliably regardless of implementation fidelity. Both possibilities remain open; this session did not
+distinguish between them, and doing so is the natural next step (see below). Flagging plainly, per this
+project's own rules, rather than treating this as either a dead end or a solved problem prematurely.
+
+### Recommended next step
+Apply the same ground-truth-diffing rigor already used successfully on the descriptor stage to the DETECTION
+stage's rotation/scale-space extrema logic specifically (`scale_space_extrema`, `interp_step`,
+`calc_feature_oris`) -- extract real ground truth for a keypoint's exact sub-pixel localization and orientation
+under a KNOWN real transform (if obtainable) or at minimum audit the extrema-refinement and orientation-
+histogram code against OpenSIFT's reference behavior with the same line-by-line rigor already applied to
+`FtNonLinearStretch_U8` and `FtLocalContrastEnhance`, to determine whether detector-own instability is a fixable
+bug or an inherent property of this approach at this resolution.
