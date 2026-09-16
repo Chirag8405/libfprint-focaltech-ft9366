@@ -263,7 +263,14 @@ float focal_verify_two_templates(const FocalFeature *A, int na, const unsigned c
 
     Affine2D H;
     int *inlierFlags = malloc((size_t)ncand * sizeof(int));
-    int inliers = ransac_affine(A, B, cand, ncand, 6.0, 2000, &H, inlierFlags);
+    /* Inlier radius tightened from an initial 6.0px after quantifying
+     * chance-level collisions: with ~40-60 densely-packed keypoints in a
+     * 64x80 image, a 6px radius gives ~1 EXPECTED chance-inlier per
+     * candidate even for a WRONG transform, so RANSAC's best-of-2000
+     * search over random transforms can plausibly reach double-digit
+     * "inlier" counts purely by chance (see PROTOCOL.md). At 2.5px,
+     * expected chance-inliers per candidate drop to ~0.15-0.2. */
+    int inliers = ransac_affine(A, B, cand, ncand, 2.5, 2000, &H, inlierFlags);
     *outInliers = inliers;
     free(inlierFlags);
     free(cand);

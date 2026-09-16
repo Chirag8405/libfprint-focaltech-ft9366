@@ -2656,3 +2656,53 @@ promising remaining avenues, in rough priority order:
    descriptor is genuinely rotation-invariant, independent of real capture noise.
 3. Gather more real captures per the original Step 5 plan (15-20 same-finger, 10+ different-finger) --
    deferred until the matcher itself is more trustworthy, since more data won't resolve an architectural bug.
+
+## Follow-up: quantified and tested a RANSAC chance-collision hypothesis -- also not the dominant cause (2026-09-16)
+
+Status: Extended the audit from `focal_sift.c` (previous entry) to `focal_verify.c`'s RANSAC logic, per that
+entry's own recommended next step. Formed and tested a concrete, quantified hypothesis; it improved nothing
+material. Reporting honestly.
+
+### Hypothesis: 6px inlier radius is too loose for this image's keypoint density
+With ~40-60 keypoints in a 64x80=5120px image, the probability a random/incorrect transform accidentally
+lands within a 6px radius of some candidate's paired point is `pi*6^2/5120 ~= 0.022` per candidate --
+expected ~1 chance-inlier per WRONG candidate pairing at 6px, meaning RANSAC's best-of-2000-random-transforms
+search could plausibly reach double-digit "inlier" counts through chance collisions alone, given enough
+candidates and iterations. At 2.5px, the same calculation gives ~0.15-0.2 expected chance-inliers per
+candidate -- an order of magnitude tighter margin.
+
+### Test: tightened inlier radius from 6.0px to 2.5px
+Retested the full 45-pair set. Inlier counts dropped somewhat as expected (e.g. same5-vs-same6 stayed at
+19 inliers, roughly unchanged), but **the separation problem did not improve, and one pairing got WORSE**:
+`same6-vs-diff1` (different finger) scored 0.8608 with 16 inliers -- HIGHER than `same5-vs-same6` (same
+finger, 0.8459/19 inliers) at this tighter threshold. Double-digit inlier counts persist for clearly-wrong
+(different-finger) pairs even at a threshold where pure random chance-collision should be rare.
+
+### Revised understanding: likely a geometric/structural confound, not a simple parameter or chance-noise issue
+Since tightening the inlier radius by more than 2x did not meaningfully change the qualitative outcome, pure
+chance-collision is probably NOT the dominant explanation either. A more likely structural explanation: this
+sensor's 64x80 capture always shows a similarly-shaped/sized/positioned finger contact area (bounded by the
+same small sensor edges), so keypoint SPATIAL distributions across any two captures -- same finger or not --
+are constrained to a broadly similar overall shape (driven by contact-area geometry, not by fine ridge-identity
+detail). If candidate correspondence selection (currently: single best Hamming match per feature, no ratio
+test) isn't selective enough, a near-identity affine transform can still find a spatially-plausible-looking
+alignment for many WRONG correspondences, simply because keypoints from any capture tend to sit in similar
+places relative to the shared contact-area shape -- independent of whether the underlying descriptors (and
+thus the true finger identity) actually match.
+
+### Current honest state after two full audit passes (detection/orientation math, then RANSAC parameters)
+Neither pass found a single resolving bug. Both produced real, kept improvements (OpenSIFT fidelity fixes;
+tighter RANSAC threshold, both retained in the code) without resolving the core separation failure. The most
+likely remaining culprit is now believed to be candidate-correspondence selectivity (Hamming-distance-only,
+no ratio test, on a sensor where keypoint geometry alone is not very discriminative) rather than a specific
+line-level bug -- a genuinely different, harder class of problem than what's already been checked. Recommended
+next steps for a future session, in priority order:
+1. Add a ratio test to candidate correspondence selection (require the best Hamming match to be meaningfully
+   better than the second-best, the standard SIFT/ORB matching safeguard against exactly this failure mode --
+   not yet implemented at all in this first draft).
+2. If that doesn't resolve it, seriously consider whether this sensor's geometry (near-constant contact-area
+   shape across all captures) fundamentally undermines pure geometric-consensus matching on so few keypoints,
+   and whether descriptor-similarity should be weighted directly into RANSAC's consensus scoring rather than
+   used only as a one-shot candidate-selection pre-filter.
+3. Synthetic controlled-image testing (translated/rotated known patterns) remains a good complementary check,
+   not yet done.
