@@ -1449,3 +1449,58 @@ blocker for working enroll/verify. This session has already demonstrated that re
 without needing `poa_send_para` resolved (the capture pipeline tested and confirmed end-to-end does not
 depend on it). Revisit if real-world reliability issues arise that trace back to missing calibration
 finalization.
+
+## STEP 5 STATUS: matching approach tested against real data -- DOES NOT WORK, reporting honestly (2026-09-16)
+
+Status: TESTED against real same-finger and different-finger captures. Result: FAILS to discriminate correctly.
+
+### Test setup
+Three additional live captures taken (same-finger x2, different-finger x1), saved to `research/captures/`:
+`2026-09-16-baseline-nofinger.raw` (pre-existing), `match_touch1.raw`, `match_touch2.raw` (same finger, two
+separate touches), `match_different.raw` (a different finger/contact, per user instruction).
+
+Approach: background-subtract the no-finger baseline from each capture, optionally apply a local high-pass
+filter (box-blur subtraction, radius 3) to emphasize fine texture over gross contact-area effects, then
+compute normalized cross-correlation (NCC) with a small translational search (+/-6 px) to tolerate minor
+repositioning, taking the best-shift correlation as the match score.
+
+### Results -- INVERTED (wrong direction), tested twice with two variants
+
+```
+Without high-pass filter:
+  SAME finger (touch1 vs touch2):        corr = 0.6343
+  DIFFERENT (touch1 vs different):       corr = 0.7682
+  DIFFERENT (touch2 vs different):       corr = 0.8212
+
+With local high-pass filter (radius=3):
+  SAME finger (touch1 vs touch2):        corr = 0.7021
+  DIFFERENT (touch1 vs different):       corr = 0.8437
+  DIFFERENT (touch2 vs different):       corr = 0.8488
+```
+
+**The same-finger comparison scores LOWER than both different-finger comparisons, in both variants tested.**
+This is the wrong direction for a working matcher -- reporting this plainly rather than describing it as
+"close" or "nearly working." This approach, as currently implemented, does NOT meet the stated bar (same
+finger reliably matches, different finger reliably doesn't).
+
+### Plausible contributing factors (hypotheses, NOT confirmed root causes)
+- This session deliberately deferred the DAC auto-calibration feedback loop (Step 2's
+  `Img_Get_Better_DAC`/`AutoSDacUpdate` fine-tuning) since it wasn't needed for basic capture. It's plausible
+  that different touches land in different parts of the sensor's dynamic range without that calibration,
+  introducing capture-to-capture variation that dominates over actual ridge differences.
+- The sensor's effective resolution (64x80 = 5120 pixels total) is coarse; genuine fingerprint ridge pitch may
+  not be well-resolved at this scale, especially without proper calibration.
+- Translation-only alignment (no rotation search) may be insufficient even for same-finger comparisons if
+  contact angle varies between touches.
+- A single, possibly-stale no-finger baseline (captured earlier in the session) may not perfectly represent
+  the true no-touch reference at comparison time, introducing systematic noise.
+- Only one comparison pair per condition has been tested (small sample size) -- not enough data yet to
+  distinguish a systematic problem from unlucky sampling.
+
+### Honest status against this session's stated bar for Step 5
+NOT MET. "Two consecutive real captures of the same finger reliably report match, different finger reliably
+reports no match" has not been achieved. This is a genuinely open problem requiring further work -- either
+debugging/improving the matching approach (with more sample data, calibration, rotation handling, or a
+fundamentally different method such as real minutiae extraction) or accepting a different, lower initial bar.
+Flagging this clearly rather than continuing to iterate silently, since it represents a real fork in how to
+proceed for the remaining work (Steps 5 continuation and Step 6).
