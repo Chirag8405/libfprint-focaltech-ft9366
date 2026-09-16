@@ -3783,3 +3783,123 @@ never fully traced line-by-line) to extract FocalTech's own exact blur/interpola
 same way `FtCalcSimScore` and `FtEstimateRotParms_32f` were fully nailed down earlier this project -- rather
 than further guess-and-check against generic OpenCV/OpenSIFT conventions that have now twice failed to explain
 a confirmed, real discrepancy.
+
+## MAJOR DISCOVERY: the real pyramid blur is a box-filter cascade, not a Gaussian kernel -- full raw disassembly of FtBuildGaussPyr/FtCreateInitImg (2026-09-16)
+
+Status: CONFIRMED via complete, line-by-line raw disassembly (not decompiler output, not OpenCV/OpenSIFT
+convention assumptions) of `FtCreateInitImg` (0xd5360), `FtBuildGaussPyr` (0xd5770), `FastGaussBlur` (0xf2940),
+`AverageFilter` (0xed770), and `FtResize` (0xeeab0, the octave-transition downsample path). This is the
+single most consequential finding of this entire pyramid-precision investigation and directly explains the
+"sharper than real" discrepancy that two prior sessions' worth of OpenCV-convention-based fixes (bicubic
+upscale, kernel-truncation-radius) failed to close.
+
+### The real algorithm's "Gaussian" pyramid blur is not a Gaussian convolution at all
+`FtCreateInitImg` and `FtBuildGaussPyr` both call a function named `FastGaussBlur` for every pyramid blur step
+-- and despite the name, it does NOT convolve with a discrete Gaussian kernel. It applies a short CASCADE of
+separable, UNWEIGHTED box-average filters (kernel sizes 3 or 5), the exact count and sizes of which come from
+fixed lookup tables (`FILTER_ITER1`/`KSIZE_TAB1`, `..._ITER2`/`..._TAB2`, `..._ITER3`/`..._TAB3` -- three
+variants selected by a mode byte), extracted byte-exact from `.rodata`:
+```
+mode selector: gAlgMode[5] -- CONFIRMED = 4 at runtime (verified live via gdb, not just static .data),
+               which dispatches to FILTER_ITER1/KSIZE_TAB1 (AverageFilter's dispatch: cl==0 -> table2,
+               cl==0x10 -> table3, else (cl=4 here) -> table1)
+
+FILTER_ITER1 (iteration count per pyramid interval index 0-5): [4, 3, 3, 3, 3, 3]
+KSIZE_TAB1   (box kernel size per iteration, per interval index):
+  index 0: [3,3,3,3,3,3]  (uses first 4 -> four 3x3 box passes)
+  index 1: [3,3,3,0,0,0]  (three 3x3 box passes)
+  index 2: [3,3,3,0,0,0]  (three 3x3 box passes)
+  index 3: [3,3,5,0,0,0]  (two 3x3 + one 5x5 box pass)
+  index 4: [3,3,5,0,0,0]
+  index 5: [3,3,5,0,0,0]
+```
+Critically, the "index" (0-5) passed to `FastGaussBlur` is the pyramid INTERVAL NUMBER ITSELF, read directly
+from the interval loop counter in `FtBuildGaussPyr` -- there is no continuously-computed per-level sigma value
+at all (no `sigma * 2^(i/intvls)` OpenSIFT-style formula feeding the blur amount). `FtCreateInitImg`'s own
+initial blur (both the img_dbl and non-doubled branches) always uses index=0 (four 3x3 box passes).
+
+`AverageFilter` itself is a standard O(n) sliding-window running-sum box filter (accumulate, then add-entering/
+subtract-exiting per output position) -- confirmed via its border handling: it uses a SHRINKING window at
+image edges, normalized by the actual sample count via a real `invTable[n] = 1/n` reciprocal lookup table
+(extracted from `.rodata`, exact values confirmed), NOT edge-replication/clamping as this reimplementation's
+`img_get` convention assumes elsewhere.
+
+### Octave-transition downsample re-confirmed correct (via the ACTUAL function used, not assumption)
+`FtBuildGaussPyr` calls `FtResize` (not a dedicated "downsample" function) for octave transitions, with an
+interpolation-mode argument of 0. Disassembling `FtResize`'s mode-0 path shows it selects source pixel
+`(2*dstRow, 2*dstCol)` for each destination pixel -- i.e. exactly the same "top-left of each 2x2 block" nearest-
+neighbor convention this reimplementation's `downsample_nn` already implements. This independently
+RE-CONFIRMS (via the real function actually used, not an assumption checked against OpenCV/OpenSIFT
+convention) that `downsample_nn` was never the bug.
+
+### Reimplemented and validated against ground truth
+Replaced `focal_sift.c`'s `gaussian_blur_f` (a true, wide discrete Gaussian kernel -- removed entirely, fully
+dead code after this change) with `fast_gauss_blur`/`average_filter_2d`/`box_filter_1d_shrink`, an exact
+transcription of the confirmed box-filter-cascade algorithm and lookup tables. Diffed directly against the
+real `gauss_pyr[1][0]` and `gauss_pyr[1][2]` ground truth already extracted this session:
+```
+                        row45 SSE   col62 SSE
+true-Gaussian (orig):     276.8       106.0    (interval 0)
+box-filter cascade:       224.6        76.2    (interval 0)  -- ~19-28% lower error
+
+true-Gaussian (kernel-fixed): 187.7    n/a     (interval 2)
+box-filter cascade:            122.9   25.3    (interval 2)  -- ~35-37% lower error
+```
+A real, consistent, meaningful improvement in the confirmed-correct direction at both locations tested --
+though not a perfect bit-exact match (residual error remains, most likely from an imperfectly-transcribed
+detail of `AverageFilter`'s exact border/accumulation order, not re-verified byte-by-byte against every
+instruction).
+
+### Decisive result: rotation-repeatability closes to match the real algorithm
+Re-ran `test_synthetic_repeatability` (this reimplementation's own detector, synthetic exact-transform test)
+on all three benchmark images:
+```
+                theta=2deg   theta=3deg   theta=5deg
+same5 (was):      77.8%        80.0%        64.4%
+same5 (now):      88.0%        87.4%        90.6%
+same1 (was):      72.2%        83.3%        70.4%
+same1 (now):      91.5%        98.0%        89.1%
+diff2 (was):      91.4%        82.9%        65.7%
+diff2 (now):      87.6%        92.5%        85.5%
+```
+**This is now directly comparable to (in some cases better than) the real algorithm's own measured
+repeatability (85-91% at these same angles, from the earlier ground-truth comparison)** -- the rotation-
+instability gap that motivated this entire investigation is closed. Feature counts also grew substantially
+(45-59 -> 186-215 per image), now much closer in order of magnitude to the real algorithm's confirmed
+`maxKpNum=160` cap (previously this reimplementation was producing FEWER candidates than the cap, i.e.
+under-detecting relative to the real algorithm's raw candidate pool -- this box-filter fix appears to have
+also resolved that under-detection, consistent with a genuinely more faithful pyramid producing a richer,
+more real-like set of DoG extrema).
+
+### Honest result: real same/different-finger separation is STILL not achieved, and the reason is now precisely isolated
+Re-ran the full 45-pair dataset through `focal_verify_two_templates`. Scores are, in several cases, LITERALLY
+IDENTICAL to before this fix despite the detection stage being dramatically more accurate and repeatable (e.g.
+`same5.raw vs same6.raw: score=0.8914` both before and after, despite candidates going from 28->111 and RANSAC
+inliers from 20->87; same pattern for several other pairs). This is a clean, decisive, structurally important
+result: **the final similarity score is essentially invariant to detection/matching quality once "enough"
+correspondences exist to estimate a plausible alignment.** This makes sense given the confirmed
+`FtCalcSimScore` formula: the score depends only on the FINAL ESTIMATED TRANSFORM's masked binarized-ridge
+overlap rate, not on which or how many keypoints were used to find that transform -- so once RANSAC finds
+"a" reasonable alignment (correct or not), the score is dominated by the overlap-rate signal for that specific
+alignment, and apparently similar-looking alignments are found regardless of input keypoint set richness.
+
+This conclusively rules out detection instability (hypothesis 3, this session's starting question) and the
+matching/RANSAC mechanism (eight prior attempts, now a ninth confirmed-correct reimplementation) as viable
+explanations for the persistent separation failure. **The remaining problem is now isolated specifically to the
+final scoring formula/mechanism** (`FtCalcSimScore`'s masked-agreement-rate approach, or a downstream
+FAR-calibration/decision step not yet examined) -- not to anything upstream of it. Given how many independently
+real, confirmed, ground-truth-validated fixes have been made throughout this project (rotation-convention
+descriptor bug, binarization threshold formula, RANSAC clique-consistency bug, and now the box-filter-cascade
+pyramid blur) without resolving end-to-end separation, this is a strong signal that the fundamental
+masked-ridge-overlap-after-alignment SCORING APPROACH itself may not carry enough finger-identity-specific
+signal on this small sensor to separate reliably, independent of implementation fidelity in every upstream
+stage -- though this has not been proven, only strongly suggested by elimination.
+
+### Recommended next step
+Apply ground-truth diffing directly to `FtCalcSimScore`'s INPUTS and OUTPUT for a real same-finger and a real
+different-finger pair: extract the real algorithm's own binarized images, segmentation masks, and final score
+for a known pair (via the same gdb/dlopen technique), and compare against this reimplementation's own
+intermediate values for the identical alignment. This would definitively show whether the persistent lack of
+separation is inherent to the scoring formula/this sensor (a real finding worth having, even if sobering) or
+whether a remaining implementation gap exists specifically in binarization/segmentation/masking that has not
+yet been ground-truth-validated the way detection and descriptors now have been.

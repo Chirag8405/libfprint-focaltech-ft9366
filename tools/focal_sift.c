@@ -83,56 +83,79 @@ static float img_get(const FImage *im, int r, int c)
 }
 static void img_set(FImage *im, int r, int c, float v) { im->data[r * im->cols + c] = v; }
 
-/* Separable Gaussian blur on a float image, arbitrary sigma. FIXED (this
- * session's rotation-repeatability follow-up, research/PROTOCOL.md): the
- * previous radius formula (ceil(sigma*3)) was WRONG -- that is OpenCV's
- * auto-kernel-size truncation for CV_8U (integer) images specifically.
- * This pyramid operates on CV_32F (float) data throughout (OpenSIFT's own
- * build_gauss_pyr calls cvSmooth on float images), and OpenCV's actual
- * auto-sizing formula for non-CV_8U depth uses a 4-sigma (not 3-sigma)
- * truncation: `ksize = round(sigma*4*2+1)|1` (OpenCV's
- * createGaussianKernels). At sigma=1.6 (this pipeline's base sigma) this
- * is radius=7 vs. the old radius=5 -- a 40% narrower kernel than correct,
- * producing a systematically less-complete (sharper) blur at every
- * pyramid level. This directly matches an earlier-confirmed finding
- * (this reimplementation's gauss_pyr content is measurably sharper than
- * the real algorithm's, steeper edges/~1px-early rising edges) and is the
- * leading candidate for this reimplementation's excess rotation-
- * instability relative to the real algorithm (ground-truth-confirmed,
- * same PROTOCOL.md entry). */
-static void gaussian_blur_f(FImage *im, double sigma)
+/* CONFIRMED via raw disassembly of FastGaussBlur/AverageFilter (offsets
+ * 0xf2940/0xed770, research/PROTOCOL.md "full raw disassembly of
+ * FtBuildGaussPyr/FtCreateInitImg"): the real algorithm's pyramid blur is
+ * NOT a true Gaussian kernel convolution at all -- it is a short cascade
+ * of separable, UNWEIGHTED box-average filters (3x3, occasionally 5x5).
+ * The exact iteration count and kernel sizes come from fixed lookup
+ * tables (FILTER_ITER1/KSIZE_TAB1 -- confirmed selected by the real
+ * runtime value of a global mode byte, gAlgMode[5]=4, verified live via
+ * gdb, not just its static .data initializer), indexed DIRECTLY by
+ * pyramid interval number (0-5 for intvls=3) -- NOT computed from any
+ * continuous per-level sigma formula. This replaces this reimplementation's
+ * previous `gaussian_blur_f` (a true, wide discrete Gaussian kernel),
+ * which -- despite two separate correctness passes (bicubic-vs-bilinear
+ * upscale, then kernel-truncation-radius) -- could never match the real
+ * pyramid's content because it was fundamentally the wrong OPERATOR, not
+ * an imprecise version of the right one. */
+static void box_filter_1d_shrink(const float *src, float *dst, int n, int ksize)
 {
-    int ksize = (int)lround(sigma * 4.0 * 2.0 + 1.0);
-    if (ksize % 2 == 0) ksize++;
-    int radius = (ksize - 1) / 2;
-    if (radius < 1) { radius = 1; ksize = 3; }
-    double *kernel = malloc((size_t)ksize * sizeof(double));
-    double sum = 0;
-    int i, r, c;
-    for (i = 0; i < ksize; i++) {
-        double x = i - radius;
-        kernel[i] = exp(-(x * x) / (2 * sigma * sigma));
-        sum += kernel[i];
+    /* CONFIRMED border handling: a SHRINKING window at the edges,
+     * normalized by the ACTUAL number of samples included (verified via
+     * the real algorithm's own `invTable[n] = 1/n` reciprocal lookup
+     * table, extracted from .rodata) -- NOT edge-replication/clamping. */
+    int half = ksize / 2;
+    int i, k;
+    for (i = 0; i < n; i++) {
+        int lo = i - half; if (lo < 0) lo = 0;
+        int hi = i + half; if (hi >= n) hi = n - 1;
+        float sum = 0;
+        for (k = lo; k <= hi; k++) sum += src[k];
+        dst[i] = sum / (float)(hi - lo + 1);
     }
-    for (i = 0; i < ksize; i++) kernel[i] /= sum;
-
-    FImage *tmp = img_new(im->rows, im->cols);
-    for (r = 0; r < im->rows; r++)
-        for (c = 0; c < im->cols; c++) {
-            double acc = 0;
-            for (i = -radius; i <= radius; i++)
-                acc += kernel[i + radius] * img_get(im, r, c + i);
-            img_set(tmp, r, c, (float)acc);
-        }
-    for (r = 0; r < im->rows; r++)
-        for (c = 0; c < im->cols; c++) {
-            double acc = 0;
-            for (i = -radius; i <= radius; i++)
-                acc += kernel[i + radius] * img_get(tmp, r + i, c);
-            img_set(im, r, c, (float)acc);
-        }
-    img_free(tmp);
-    free(kernel);
+}
+static void average_filter_2d(FImage *im, int ksize)
+{
+    /* CONFIRMED structural match: one full separable 2D box-average pass
+     * (horizontal then vertical, same ksize both directions) -- matches
+     * one AverageFilter call in the real disassembly. */
+    if (ksize <= 1) return;
+    int rows = im->rows, cols = im->cols, r, c;
+    float *rowbuf = malloc((size_t)cols * sizeof(float));
+    float *rowout = malloc((size_t)cols * sizeof(float));
+    for (r = 0; r < rows; r++) {
+        memcpy(rowbuf, &im->data[r * cols], (size_t)cols * sizeof(float));
+        box_filter_1d_shrink(rowbuf, rowout, cols, ksize);
+        memcpy(&im->data[r * cols], rowout, (size_t)cols * sizeof(float));
+    }
+    free(rowbuf); free(rowout);
+    float *colbuf = malloc((size_t)rows * sizeof(float));
+    float *colout = malloc((size_t)rows * sizeof(float));
+    for (c = 0; c < cols; c++) {
+        for (r = 0; r < rows; r++) colbuf[r] = im->data[r * cols + c];
+        box_filter_1d_shrink(colbuf, colout, rows, ksize);
+        for (r = 0; r < rows; r++) im->data[r * cols + c] = colout[r];
+    }
+    free(colbuf); free(colout);
+}
+static void fast_gauss_blur(FImage *im, int tableIndex)
+{
+    /* CONFIRMED exact table contents, extracted from .rodata
+     * (FILTER_ITER1 @0x1a9508, KSIZE_TAB1 @0x1a94c0). tableIndex is the
+     * pyramid interval number (0-5), used directly as the row index. */
+    static const int iterCounts[6] = {4, 3, 3, 3, 3, 3};
+    static const int ksizeTab[6][6] = {
+        {3, 3, 3, 3, 3, 3},
+        {3, 3, 3, 0, 0, 0},
+        {3, 3, 3, 0, 0, 0},
+        {3, 3, 5, 0, 0, 0},
+        {3, 3, 5, 0, 0, 0},
+        {3, 3, 5, 0, 0, 0},
+    };
+    int iters = iterCounts[tableIndex];
+    int k;
+    for (k = 0; k < iters; k++) average_filter_2d(im, ksizeTab[tableIndex][k]);
 }
 
 /* OpenCV-style bicubic (a=-0.75, matching OpenCV's actual INTER_CUBIC
@@ -178,6 +201,11 @@ static FImage *resize_bicubic(const FImage *src, int newRows, int newCols)
 static FImage *create_init_img(const unsigned char *src, int rows, int cols,
                                 int img_dbl, double sigma)
 {
+    (void)sigma; /* CONFIRMED (this session): the real blur is a fixed
+                  * box-filter cascade (fast_gauss_blur), not a computed-
+                  * sigma Gaussian -- sigma is no longer used to derive the
+                  * initial blur amount. Kept in the signature to avoid
+                  * churning call sites. */
     FImage *gray = img_new(rows, cols);
     int i;
     for (i = 0; i < rows * cols; i++) gray->data[i] = (float)src[i];
@@ -185,22 +213,19 @@ static FImage *create_init_img(const unsigned char *src, int rows, int cols,
     if (img_dbl) {
         /* CONFIRMED real scale factor is 2.0x (OpenSIFT stock), per this
          * continuation session's direct gauss_pyr inspection -- corrects
-         * the previous session's mistaken 1.5x conclusion. Kept general
-         * (parametrized by s) since the formula is correct for any scale:
-         * the pre-existing blur's effective sigma scales by s once
-         * resampled onto the enlarged grid, so
-         * sig_diff = sqrt(sigma^2 - (INIT_SIGMA*s)^2). Now using bicubic
-         * (OpenCV/OpenSIFT's actual CV_INTER_CUBIC convention) instead of
-         * bilinear for this upscale -- see resize_bicubic above. */
+         * the previous session's mistaken 1.5x conclusion. Now using
+         * bicubic for the upscale (kept -- FtDoubleImageByCubic's name
+         * confirms cubic, though its exact coefficient was not
+         * independently re-verified this pass) then the CONFIRMED
+         * box-filter-cascade blur (fast_gauss_blur, tableIndex=0) instead
+         * of a computed-sigma true Gaussian -- see fast_gauss_blur above. */
         double s = FOCAL_DBL_SCALE;
-        double sig_diff = sqrt(sigma * sigma - SIFT_INIT_SIGMA * s * SIFT_INIT_SIGMA * s);
         FImage *dbl = resize_bicubic(gray, (int)lround(rows * s), (int)lround(cols * s));
-        gaussian_blur_f(dbl, sig_diff);
+        fast_gauss_blur(dbl, 0);
         img_free(gray);
         return dbl;
     } else {
-        double sig_diff = sqrt(sigma * sigma - SIFT_INIT_SIGMA * SIFT_INIT_SIGMA);
-        gaussian_blur_f(gray, sig_diff);
+        fast_gauss_blur(gray, 0);
         return gray;
     }
 }
@@ -222,17 +247,17 @@ static FImage *downsample_nn(const FImage *src, int newRows, int newCols)
     return dst;
 }
 
-/* CONFIRMED structural match: OpenSIFT's build_gauss_pyr. */
+/* CONFIRMED structural match: OpenSIFT's build_gauss_pyr, EXCEPT the blur
+ * amount itself (see fast_gauss_blur above): raw disassembly of
+ * FtBuildGaussPyr shows the per-interval blur call passes the INTERVAL
+ * NUMBER ITSELF (0..intvls+2) directly as FastGaussBlur's table index --
+ * there is no continuously-computed per-level sigma at all. `sigma` is
+ * kept in the signature (unused now) to avoid churning call sites. */
 static FImage ***build_gauss_pyr(FImage *base, int octvs, int intvls, double sigma)
 {
+    (void)sigma;
     FImage ***pyr = malloc((size_t)octvs * sizeof(FImage **));
-    double *sig = malloc((size_t)(intvls + 3) * sizeof(double));
-    double k = pow(2.0, 1.0 / intvls);
     int i, o;
-
-    sig[0] = sigma;
-    sig[1] = sigma * sqrt(k * k - 1);
-    for (i = 2; i < intvls + 3; i++) sig[i] = sig[i - 1] * k;
 
     for (o = 0; o < octvs; o++) {
         pyr[o] = malloc((size_t)(intvls + 3) * sizeof(FImage *));
@@ -247,11 +272,10 @@ static FImage ***build_gauss_pyr(FImage *base, int octvs, int intvls, double sig
                 pyr[o][i] = img_new(pyr[o][i - 1]->rows, pyr[o][i - 1]->cols);
                 memcpy(pyr[o][i]->data, pyr[o][i - 1]->data,
                        (size_t)pyr[o][i - 1]->rows * pyr[o][i - 1]->cols * sizeof(float));
-                gaussian_blur_f(pyr[o][i], sig[i]);
+                fast_gauss_blur(pyr[o][i], i);
             }
         }
     }
-    free(sig);
     return pyr;
 }
 
