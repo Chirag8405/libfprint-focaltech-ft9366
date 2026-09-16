@@ -1,0 +1,15 @@
+# DIAGNOSTIC-ONLY: real intermediate sample array from inside FtMfbDescriptors
+# (extracted via gdb breakpoint at bias+FtMfbDescriptors_offset+0x2e0, right after
+# the 45-point sample-collection loop, before the ModePairs bit-comparison loop)
+# Keypoint: feat1 index 66, same5.raw
+# x=62.525066 y=45.641518 ori=-0.314893
+# Real final descriptor: 27f777ff 90703880 be5ffb67 780e39fd 0000040e 3ffffce0 fffffef7 c00244f9
+# Extraction verified exact: recomputing ModePairs bit-comparison from these 45 samples
+# reproduces the real descriptor bit-for-bit (Hamming = 0/256).
+# 45 raw sample values, in coordinarePairs[] index order (0..44):
+182.629395 177.748978 170.748093 163.800781 155.242599 152.378143 158.534164 165.680023
+173.310303 180.687561 188.935715 188.633926 180.891830 170.530289 160.096741 151.174194
+142.806641 134.991165 129.374268 135.719086 153.971573 172.716064 179.064636 183.127563
+186.396530 167.542282 179.090912 195.545624 190.169647 177.653091 164.346481 155.931763
+149.127167 141.529129 129.820938 118.161690 111.455261 118.867287 147.322174 177.224976
+188.599396 189.913391 173.162827 163.408524 152.497131

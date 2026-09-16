@@ -3135,3 +3135,93 @@ truth already in hand). Next step for a future session: extract that specific gr
 same `FtMfbDescriptors` breakpoint technique, reading the keypoint's octave/interval fields directly if
 accessible, or by testing our OWN descriptor computation across ALL candidate octaves for a known keypoint and
 checking which one's resulting descriptor best matches the real one -- a direct, decisive test not yet run).
+
+## Octave/interval hypothesis REFUTED; real remaining bug found: rotation-convention fix was only coincidentally right (2026-09-16)
+
+Status: CONFIRMED via direct real-memory struct reads and systematic ground-truth diffing on a SECOND keypoint.
+This corrects the previous entry's leading hypothesis and closes the descriptor-computation investigation.
+
+### Step 1: extracted the real algorithm's internal detection struct for two known keypoints
+Using the confirmed 40-byte internal feature struct layout (`x@0,y@4,ori@12,scl@16,octave@28`), read
+`features->first->data + 66*40` directly for `same5.raw` feat1 index 66 (`x=62.525066, y=45.641518,
+ori=-0.314893, scl=2.539185, octave=1`). Cross-checked our own detector's independent output for the same
+physical point (via a temporary debug hook in `focal_extract_features`): `octv=1, intvl=2, scl=2.5847`. The
+octave MATCHES (1=1) and the interval-implied scale is close (2.539 vs 2.585) -- yet the full-pipeline Hamming
+distance for this keypoint was 184/256 (worse than random). **This single data point already contradicts the
+octave/interval-mismatch hypothesis**: here octave/interval agree closely and the descriptor is still garbage.
+
+### Step 2: extracted REAL 45-sample array for keypoint 66 (previously only had it for keypoint 0)
+The earlier "MAJOR FIX CONFIRMED" session's sample-array ground truth (`same5_feat0_real_samples.txt`) was for
+feat1 index 0 ONLY, despite an earlier log entry's header mistakenly citing index 66 -- corrected here. Extracted
+a fresh, independently-verified real sample array for index 66 via the same `FtMfbDescriptors+0x2e0` gdb
+breakpoint technique (counting hits via `ignore 2 66` to reach call #67, then confirming by recomputing the
+ModePairs bit-comparison from the dumped samples and getting an EXACT bit-for-bit match to the real descriptor,
+Hamming=0/256 -- proof the extraction is correct, not guessed). Saved to
+`research/ground_truth/same5_feat66_real_samples.txt`.
+
+### Step 3: swept all octave/interval combinations using REAL x,y,ori -- none matched
+Sampling with keypoint 66's REAL x,y,ori at every octave(0-3)/interval(0-5) combination in our own pyramid,
+using the "confirmed" ori+PI rotation from the previous session, gave Hamming distances of 69-193/256 across
+ALL combinations -- no octave/interval choice reproduces the real descriptor. This decisively **refutes**
+octave/interval assignment as the (or a) root cause: even with the oracle-correct octave (1) and a
+scale-consistent interval (2), sum-sq-error against the real 45-sample array was 78,291 (vs. keypoint 0's
+94,447 BEFORE any fix was applied) -- i.e. keypoint 66 was as badly wrong as keypoint 0 was before Fix 1, even
+though the "ori+PI" fix was supposedly already applied.
+
+### Step 4: ruled out interpolation method and small residual rotation/translation
+Bilinear interpolation instead of nearest-neighbor rounding for sample fetch: no meaningful change (SSE 80,899
+vs 78,291). A 2D grid search over small additional angle offsets (-0.6..0.6 rad) and position offsets (-2..2px)
+against the real sample array found no clean local minimum -- best result sat at the search boundary with only
+~33% SSE reduction, ruling out a simple residual parametric correction.
+
+### Step 5: systematic rotation-convention search found the REAL fix
+Searched all 8 combinations of {theta in ori, -ori, ori+PI, PI-ori, ori+-PI/2, -ori+-PI/2} x {dx/dy swap} x
+{2 independent sign flips} against keypoint 66's real sample array. Best by a huge margin: **theta = -ori, no
+swap, no extra sign flips** (i.e. `cos_o = cos(ori), sin_o = -sin(ori)`) -- SSE = 3,368 vs. the previous
+"confirmed" ori+PI convention's SSE = 78,291 (23x better). Verified against BOTH known keypoints with the new
+convention: keypoint 66 -> Hamming 29/256 (was 184-193/256 under every octave/interval combo with ori+PI);
+keypoint 0 -> Hamming 28/256 (was 29/256 under ori+PI -- also slightly improved).
+
+### Root cause of the previous session's wrong conclusion
+Keypoint 0's orientation (1.596882 rad, ~91.5 degrees) is close to PI/2, a special angle where `ori+PI` and
+`-ori` nearly numerically coincide (differ by ~0.05 rad here), making the WRONG convention look almost as good
+as the right one when validated against only that single keypoint. Keypoint 66's orientation (-0.314893 rad,
+~-18 degrees) is a generic angle where the two conventions diverge sharply, which is what exposed the error.
+**Lesson applied going forward: single-keypoint ground-truth validation is insufficient when the keypoint's
+orientation is near a degenerate/special angle; use keypoints spanning diverse orientations.**
+
+### Fix applied
+`compute_binary_descriptor` in `focal_sift.c` changed from `cos_o=-cosf(ori), sin_o=-sinf(ori)` (ori+PI) to
+`cos_o=cosf(ori), sin_o=-sinf(ori)` (theta=-ori). The ModePairs comparison-operator fix (`sample[a] >
+sample[b]`) from the previous session remains correct and unchanged.
+
+### Re-validation against ground truth: large, clean improvement
+`diff_ground_truth2` (tight matches: dist<1px, ori<0.1rad) on `same5.raw`: **avg Hamming dropped from 142.0/256
+to 24.2/256** (n=13). This is now a clearly GOOD match by any reasonable threshold, not an ambiguous partial
+improvement.
+
+### Honest result: full RANSAC-based verify_two_templates STILL shows no same/different separation
+Re-ran the full same/different-finger dataset (`same1-6.raw`, `diff1-4.raw`, 45 pairs) through
+`focal_verify_two_templates` (the actual RANSAC+affine+scoring matcher, not the crude average-Hamming
+diagnostic). Result: same-finger scores range 0.49-0.86, different-finger scores range 0.48-0.86 -- **fully
+overlapping, no threshold separates them**, despite the descriptor computation itself now being confirmed
+accurate on tight ground-truth matches. (Note: the crude "average best-Hamming across all detected features"
+diagnostic used earlier in this session is now understood to be the wrong tool for a RANSAC-style matcher --
+most features in two captures of the same finger simply don't correspond due to translation/partial overlap,
+so averaging over all of them dilutes the signal from the subset that does correspond. The RANSAC-based
+`focal_verify_two_templates` score is the correct thing to evaluate, and it is what shows no separation.)
+
+### Conclusion: descriptor computation is now confirmed correct; remaining problem is isolated to the matching/scoring stage
+This decisively separates two previously-conflated failure modes. `compute_binary_descriptor` (detection +
+descriptor sampling + bit comparison) is now validated against ground truth on two independent keypoints at
+different orientations, with a clean ~24/256 average Hamming on tight full-pipeline matches. The persistent
+lack of same/different-finger separation is NOT explained by descriptor correctness -- it must be in
+`focal_verify_two_templates` (task #4, still in_progress): candidate-pair generation (Hamming threshold for
+considering two descriptors a candidate match), the RANSAC affine-consistency model/threshold, or the final
+scoring formula. None of these have been validated against real ground truth the way the descriptor was.
+
+### Next concrete action
+Apply the same ground-truth-diffing discipline to `FtVerifyTwoTemplate`: extract real intermediate values (real
+candidate-pair count, real RANSAC inlier set, or real final score) for a known same-finger and known
+different-finger pair via the same gdb/dlopen technique, and diff against `focal_verify_two_templates`'s own
+intermediate output to localize whether the bug is in candidate generation, RANSAC, or scoring.

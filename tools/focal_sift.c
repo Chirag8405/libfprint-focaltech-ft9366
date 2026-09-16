@@ -556,22 +556,22 @@ static void compute_binary_descriptor(FImage ***gauss_pyr, const FocalKeypoint *
                                        unsigned int desc[8])
 {
     FImage *im = gauss_pyr[f->octv][f->intvl];
-    /* CONFIRMED via ground-truth sample-array diffing (research/PROTOCOL.md):
-     * the real algorithm's steered sampling is rotated by f->ori + PI
-     * relative to the naive convention (equivalently: negate both cos_o
-     * and sin_o). Verified directly: using the real ori and real pixel
-     * data, this single sign flip dropped sum-of-squared sample error by
-     * ~10x (1,052,610 -> ~94,447 across the 45 samples) for a real known
-     * keypoint. Likely stems from a orientation-reference-axis convention
-     * difference between this reimplementation's calc_grad_mag_ori (with
-     * its OpenSIFT-derived y-flip trick) and the real algorithm's own. */
-    float cos_o = -cosf(f->ori);
-    float sin_o = -sinf(f->ori); /* the real binary derives sin from
-                                   sqrt(1-cos^2) with a sign fix -- using
-                                   sinf directly here is algebraically
-                                   equivalent and avoids replicating a
-                                   sign-correction branch not fully
-                                   disassembled with certainty. */
+    /* CONFIRMED via ground-truth sample-array diffing on TWO independent
+     * real keypoints at very different orientations (research/PROTOCOL.md):
+     * the real algorithm's steered sampling uses theta = -f->ori (i.e.
+     * cos_o=cos(ori), sin_o=-sin(ori)), not ori+PI. An earlier version of
+     * this fix (negate both cos_o and sin_o, equivalent to rotating by
+     * ori+PI) was validated against only one keypoint whose orientation
+     * (~1.597 rad, near PI/2) happens to make ori+PI and -ori nearly
+     * numerically coincide -- masking the error. A second keypoint at a
+     * generic orientation (-0.315 rad) exposed it: ori+PI gave sum-sq
+     * error ~78,291 and Hamming 185/256, while a systematic search over
+     * rotation conventions found theta=-ori gives sum-sq error ~3,368 and
+     * Hamming 29/256 -- and re-checking the first keypoint with theta=-ori
+     * also gives Hamming 28/256 (previously 29/256 under the wrong
+     * convention). theta=-ori is confirmed correct for both. */
+    float cos_o = cosf(f->ori);
+    float sin_o = -sinf(f->ori);
     float samples[FOCAL_NUM_SAMPLE_POINTS];
     int i;
     for (i = 0; i < FOCAL_NUM_SAMPLE_POINTS; i++) {
