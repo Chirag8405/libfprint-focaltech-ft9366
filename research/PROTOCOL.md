@@ -2187,3 +2187,75 @@ disassembly/decompile output.
 `FtScaleSpaceExtrema` (89 cx, 139 bbs -- the core detection loop, directly uses `contrThr`/`curvThr`) and
 `FtInValidPixelSet` (35 cx -- FocalTech-specific, likely integrates the earlier-traced segmentation/bad-pixel
 masks) are next, being the two highest-value remaining pieces in this stage.
+
+## MILESTONE: FtScaleSpaceExtrema + orientation stage structurally confirmed against full OpenSIFT reference (2026-09-16)
+
+Status: CONFIRMED (real signatures/callee structure from disassembly, cross-checked against OpenSIFT's actual
+public source fetched via WebFetch -- not full instruction-by-instruction verification of all 947 lines of
+decompiled FtScaleSpaceExtrema, which is not the highest-value use of remaining time given the strength of
+structural correspondence already established; deferring bit-exactness to the planned intermediate-value diff)
+
+### FtScaleSpaceExtrema(ST_IplImage ***dog_pyr, SINT32 octvs, SINT32 intvls, FP32 contrThr, SINT32 curvThr, ST_Seq **featSeq, ST_MemStorage *storage)
+Signature is an exact parameter-for-parameter match to OpenSIFT's `scale_space_extrema`. Confirmed internal
+structure: creates a sequence via `FtCreateSeq` (matches `cvCreateSeq`), allocates a `dog_pyr[0][0]->width *
+height`-sized per-octave dedup buffer (matches OpenSIFT's `feature_mat` trick for avoiding double-counting a
+pixel location found at multiple DoG intervals), and calls two dedicated helpers matching OpenSIFT's
+`interp_step`/`interp_contr` by name and signature:
+```c
+void  FtInterpStep(ST_IplImage ***dogPyr, SINT32 octv, SINT32 intvl, SINT32 r, SINT32 c, FP32 *xi, FP32 *xr, FP32 *xc);
+float FtInterpContr(ST_IplImage ***dogPyr, SINT32 octv, SINT32 intvl, SINT32 r, SINT32 c, FP32 xi, FP32 xr, FP32 xc);
+```
+`FtInterpStep`'s body calls `FtDeriv3D()`, `FtHessian3D()`, `FtInvert3D()` in that exact order, then computes
+`X = -H_inv * dD` via manual dot-product multiply-and-negate (float sign-bit XOR) -- structurally identical to
+OpenSIFT's `deriv_3D`/`hessian_3D`/`cvInvert`/`cvGEMM(..., -1, ...)` sequence. `is_extremum` (26-neighbor
+compare) and `interp_extremum`'s iteration loop are not separate calls -- almost certainly inlined directly
+into `FtScaleSpaceExtrema` itself (consistent with OpenSIFT's own small `static` functions being inline
+candidates), matching its size/complexity (89 cx) being large enough to contain that inlined logic.
+
+### Full OpenSIFT reference material fetched (public source, `robwhess/opensift`, `src/sift.c`) -- to be used
+### directly as the reimplementation basis for the remaining un-customized parts of this stage
+```c
+// deriv_3D: central-difference gradient [dx,dy,ds] of the DoG value at (octv,intvl,r,c)
+dx = (pixval(dog,r,c+1) - pixval(dog,r,c-1)) / 2
+dy = (pixval(dog,r+1,c) - pixval(dog,r-1,c)) / 2
+ds = (pixval(dog[intvl+1],r,c) - pixval(dog[intvl-1],r,c)) / 2
+
+// hessian_3D: central-difference 3x3 Hessian [dxx,dxy,dxs; dxy,dyy,dys; dxs,dys,dss]
+dxx = pixval(r,c+1)+pixval(r,c-1)-2v ; dyy = pixval(r+1,c)+pixval(r-1,c)-2v ; dss = pixval(intvl+1)+pixval(intvl-1)-2v
+dxy = (pixval(r+1,c+1)-pixval(r+1,c-1)-pixval(r-1,c+1)+pixval(r-1,c-1))/4   (dxs, dys analogous across intvl)
+
+// interp_contr: contr = pixval(octv,intvl,r,c) + 0.5 * dot(dD, [xc,xr,xi])
+
+// is_too_edge_like: reject if det(H2x2)<=0, or if tr^2/det >= (curv_thr+1)^2/curv_thr  (H2x2 = [dxx dxy; dxy dyy])
+
+// calc_feature_oris (per detected keypoint):
+hist = ori_hist(gauss_pyr[octv][intvl], r, c, n=36, rad=round(4.5*scl_octv), sigma=1.5*scl_octv)
+smooth_ori_hist(hist,36) x2 passes  (tri-point blur: hist[i] = .25*prev + .5*hist[i] + .25*next, circular)
+omax = max(hist)
+add_good_ori_features(features, hist, 36, omax*0.8, feat)   -- adds one feature per local peak >= 0.8*omax
+
+// ori_hist: for each (i,j) in [-rad,rad]^2, if calc_grad_mag_ori succeeds: weight by gaussian(i,j,sigma), bin by angle
+// calc_grad_mag_ori: dx=pixval(r,c+1)-pixval(r,c-1); dy=pixval(r-1,c)-pixval(r+1,c); mag=sqrt(dx^2+dy^2); ori=atan2(dy,dx)
+// add_good_ori_features: local peak in circular histogram -> parabolic interpolation for sub-bin angle -> new feature per peak
+```
+This is well-specified, standard, publicly-verifiable math -- the reimplementation plan is to use this directly
+for these stages rather than re-deriving from disassembly, reserving actual disassembly effort for confirming
+FocalTech-specific deviations only.
+
+### FtInValidPixelSet(ST_Seq *features, UINT8 *validMask, UINT16 imgCols, UINT16 imgRows) -- FULLY TRACED, FocalTech-specific
+```
+for each feature f (popped from the front of the sequence):
+  (x0,y0) = round(f.x - 1.0), round(f.y - 1.0);  (x1,y1) = round(f.x + 1.0), round(f.y + 1.0)   -- +/-1px box
+  if any pixel in that box has its bit UNSET in the packed validMask bitset (same bit-packing scheme
+     confirmed earlier for FtGenBinImgForSamllSensor's output): discard/free this feature
+  else: push the feature back into the sequence (kept)
+```
+This is the concrete integration point ties the earlier-traced segmentation/binarization stage to keypoint
+detection: any keypoint landing on or near a background/invalid-mask pixel is dropped. Confirms the earlier
+pipeline mapping's hypothesis about this function's role.
+
+### Remaining for Step 2
+`FtComputeDescriptors`'s dual appearance (inside both `FtGetMfsFeatures` and, presumably, `FtGetMfbFeatures`)
+still needs resolving. Given the strength of correspondence established, moving to check it briefly, then
+proceeding to Step 3 (`FtGetMfbFeatures`, the genuinely bespoke binary descriptor with no public reference)
+since that is the highest-remaining-uncertainty piece of the whole matching pipeline.
