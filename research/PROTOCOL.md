@@ -722,3 +722,49 @@ sram_write(0x1881, 0x0f0c) -> 05 fa 98 81 00 01 0f 0c
 Remaining ~87% of `img_mode_init` and ~60% of `fdt_mode_init` (after the point where it calls `img_mode_init`)
 still not traced. Running tally: 5 confirmed sram_write commands now integrated for this portion of the real
 init sequence, all tested clean.
+
+## Update: img_mode_init continued -- 0x1804/Set_Scan_Rate_2M/0x1807, tested clean (2026-09-16)
+
+Status: CONFIRMED (static disassembly + live hardware test, zero timeouts, including live read-modify-write)
+
+### Second fw9366_context[0xfc] gate found and correctly resolved
+
+At 0x15bcec, img_mode_init checks `fw9366_context[0xfc] == 0xa3` (a state value distinct from fdt_mode_init's
+0xa0/0xa1/0xa2). At the real invocation point, `+0xfc` is still 0xa0 (fdt_mode_init's own write to 0xa1 happens
+AFTER img_mode_init returns) -- so `0xa0 != 0xa3`, gate passes through to the main block, which itself then
+sets `+0xfc = 0xa3`.
+
+### sram_write(0x1804, 0x27ca)
+```
+sram_bits_set(sram_bits_set(sram_bits_set(0x7c0, hi=1,lo=0,new=Fw9366_cfg[0xa]),
+                             hi=3,lo=3,new=1 [since Fw9366_cfg[0xa]=2>1]),
+               hi=0xd,lo=0xd,new=1)
+= 0x27ca   -- Fw9366_cfg[0xa]=0x02 confirmed via already-traced cfg_init
+```
+
+### fw9366_Set_Scan_Rate_2M() -- NEW, fully self-contained on live hardware state
+```
+v = sram_read(0x1806); v = bits_set(v,13,7,9); sram_write(0x1806, v)
+v = sram_read(0x180a); v = bits_set(v,13,7,9); v = bits_set(v,6,0,3); sram_write(0x180a, v)
+v = sram_read(0x180b); v = bits_set(v,13,7,4); v = bits_set(v,6,0,8); sram_write(0x180b, v)
+```
+No host-state dependency at all -- reads the actual current hardware value each time. Added a real
+`sram_bits_set()` C implementation (pure bitfield math, matching the traced logic exactly) to
+`tools/rts5811_wake_test.c` for this.
+
+### sram_write(0x1807, 0x18e1)
+```
+sram_bits_set(sram_bits_set(1, hi=0xd,lo=5,new=Fw9366_cfg[0xc]-1), hi=4,lo=4,new=0 [Fw9366_cfg[2]!=0])
+= 0x18e1   -- Fw9366_cfg[0xc]=0xc8 (this session's earlier live smic_flag=0 measurement), Fw9366_cfg[2]=1 confirmed
+```
+
+### Live hardware test -- all clean, zero timeouts, including real read-modify-write cycles
+```
+sram_write(0x1804, 0x27ca)     -> 05 fa 98 04 00 01 27 ca
+sram_read(0x1806)  -> 09 bb    -> bits_set -> sram_write(0x1806, 0x04bb) -> 05 fa 98 06 00 01 04 bb
+sram_read(0x180a)  -> 09 87    -> bits_set -> sram_write(0x180a, 0x0483) -> 05 fa 98 0a 00 01 04 83
+sram_read(0x180b)  -> 04 91    -> bits_set -> sram_write(0x180b, 0x0208) -> 05 fa 98 0b 00 01 02 08
+sram_write(0x1807, 0x18e1)     -> 05 fa 98 07 00 01 18 e1
+```
+
+Running tally: img_mode_init now ~25% traced (up from ~13%). Remaining ~75% still untraced.

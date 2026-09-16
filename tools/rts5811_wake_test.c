@@ -84,6 +84,17 @@ static void sram_encode_addr(unsigned short addr, unsigned char *hi, unsigned ch
     *lo = (unsigned char)(addr & 0xff);
 }
 
+/* fw9366_sram_bits_set(value, hi, lo, new_bits), traced at 0x154d7d: pure
+ * local bitfield helper, no I/O. width = hi-lo+1; clear those bits in
+ * value, then OR in (new_bits << lo) masked to that width. */
+static unsigned short sram_bits_set(unsigned short value, int hi, int lo, unsigned short new_bits)
+{
+    int width = hi - lo + 1;
+    unsigned short mask = (unsigned short)(((1u << width) - 1u) << lo);
+    unsigned short cleared = (unsigned short)(value & ~mask);
+    return (unsigned short)(cleared | ((new_bits << lo) & mask));
+}
+
 /* fw9366_sram_write(addr, value), traced at 0x1660e3: write-only, opcode
  * [0x05, 0xfa]. */
 static int sram_write(libusb_device_handle *h, unsigned short addr, unsigned short value)
@@ -168,6 +179,33 @@ static int idle_enter(libusb_device_handle *h)
     }
     printf(" idle_enter(): wm_switch(0xa)\n");
     wm_switch(h, 0xa);
+    return 0;
+}
+
+/* fw9366_Set_Scan_Rate_2M(), traced at 0x15b71c: three live
+ * read-modify-write ops on real SRAM registers, no host-state
+ * dependency at all -- each starts from a fresh sram_read of the actual
+ * current hardware value, so this is safe to replicate exactly regardless
+ * of any other state question. */
+static int set_scan_rate_2m(libusb_device_handle *h)
+{
+    unsigned short v;
+    printf(" set_scan_rate_2m(): 0x1806\n");
+    sram_read(h, 0x1806, &v);
+    v = sram_bits_set(v, 13, 7, 9);
+    sram_write(h, 0x1806, v);
+
+    printf(" set_scan_rate_2m(): 0x180a\n");
+    sram_read(h, 0x180a, &v);
+    v = sram_bits_set(v, 13, 7, 9);
+    v = sram_bits_set(v, 6, 0, 3);
+    sram_write(h, 0x180a, v);
+
+    printf(" set_scan_rate_2m(): 0x180b\n");
+    sram_read(h, 0x180b, &v);
+    v = sram_bits_set(v, 13, 7, 4);
+    v = sram_bits_set(v, 6, 0, 8);
+    sram_write(h, 0x180b, v);
     return 0;
 }
 
@@ -422,7 +460,28 @@ int main(void)
      *   if (param==0): sram_write(0x1800, 0x4ffe)   -- FIXED constant, our
      *       case (param=0), no host-state dependency.
      *   (param!=0 branch not relevant -- real call always uses param=0 here)
-     * Remaining ~87% of img_mode_init's body NOT yet traced -- stopping
+     *
+     * CONTINUED (both branches converge here): there is a SECOND
+     * fw9366_context[0xfc] gate at this point (0x15bcec), checking against
+     * 0xa3 this time (a state value distinct from fdt_mode_init's 0xa0/
+     * 0xa1/0xa2). At this exact point in the real sequence, +0xfc is still
+     * 0xa0 (fdt_mode_init's own write to 0xa1 happens AFTER img_mode_init
+     * returns), so 0xa0 != 0xa3 and the gate is confirmed passed through to
+     * the main block, which then sets +0xfc=0xa3 itself:
+     *   fw9366_context[0xfc] = 0xa3   -- host-side only, no wire effect
+     *   sram_write(0x1804, sram_bits_set(sram_bits_set(sram_bits_set(0x7c0,
+     *       hi=1,lo=0,new=Fw9366_cfg[0xa]), hi=3,lo=3,new=1 [since
+     *       Fw9366_cfg[0xa]=2>1]), hi=0xd,lo=0xd,new=1))
+     *     = sram_write(0x1804, 0x27ca)   -- Fw9366_cfg[0xa]=0x02 confirmed via cfg_init
+     *   fw9366_Set_Scan_Rate_2M()   -- three live read-modify-write ops,
+     *       no host-state dependency (reads real current hardware value
+     *       each time) -- see set_scan_rate_2m() below.
+     *   sram_write(0x1807, sram_bits_set(sram_bits_set(1, hi=0xd,lo=5,
+     *       new=Fw9366_cfg[0xc]-1), hi=4,lo=4,new=0 [since Fw9366_cfg[2]!=0]))
+     *     = sram_write(0x1807, 0x18e1)   -- Fw9366_cfg[0xc]=0xc8 confirmed
+     *       (this session's earlier smic_flag=0 live measurement), Fw9366_cfg[2]=1 confirmed
+     *
+     * Remaining ~75% of img_mode_init's body still NOT traced -- stopping
      * integration at this point, same honest-gap policy as before. */
     printf("-- img_mode_init(0) opening: idle_enter() again --\n");
     idle_enter(h);
@@ -430,7 +489,13 @@ int main(void)
     sram_write(h, 0x1801, 0xfcb6);
     printf("-- img_mode_init(0): sram_write(0x1800, 0x4ffe) [fixed constant, param==0 branch] --\n");
     sram_write(h, 0x1800, 0x4ffe);
-    printf("-- [REST OF img_mode_init(0) NOT YET TRACED -- ~87%% remaining] --\n\n");
+    printf("-- img_mode_init(0): sram_write(0x1804, 0x27ca) --\n");
+    sram_write(h, 0x1804, 0x27ca);
+    printf("-- img_mode_init(0): set_scan_rate_2m() --\n");
+    set_scan_rate_2m(h);
+    printf("-- img_mode_init(0): sram_write(0x1807, 0x18e1) --\n");
+    sram_write(h, 0x1807, 0x18e1);
+    printf("-- [REST OF img_mode_init(0) NOT YET TRACED -- ~75%% remaining] --\n\n");
 
     printf("-- sram_write(0x1801, 0xfc9b) --\n");
     sram_write(h, 0x1801, 0xfc9b);
