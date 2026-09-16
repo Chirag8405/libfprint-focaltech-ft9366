@@ -1737,3 +1737,56 @@ reimplementation, rather than calling into the real .so functions (even for quic
 against them directly. This preserves the original zero-runtime-dependency goal stated at the start of the
 project. Proceeding to map FtGetTemplate's (feature extraction) and FtVerifyTwoTemplate's (matching) internal
 call structure next, using DWARF-recovered function/variable names, before any linear reading.
+
+### FtGetTemplate pipeline mapped (call graph, not yet linear-traced) (2026-09-16)
+Per standing methodology (map call structure before linear reading), extracted `FtGetTemplate`'s real callee
+list via `r2 axff` and cross-referenced against DWARF-recovered names. The debug log strings embedded in the
+binary (e.g. `"FtGetTemplate...gAlgInfor.intvls=%d gAlgInfor.sigma=%f gAlgInfor.contrThr=%f gAlgInfor.curvThr=%d"`)
+directly name the pipeline stages. Confirmed real pipeline, in execution order:
+
+```
+raw image bytes
+  -> FtCreateImage                       (image buffer setup, x3 calls -- likely orig/working/scratch buffers)
+  -> FtNonLinearStretch_U8                (42 cx, contrast stretch)                          [preprocessing]
+  -> f9395_image_enhance                  (sensor-family-specific enhancement)                [preprocessing]
+  -> FtLocalContrastEnhance               (52 cx, local contrast)                             [preprocessing]
+  -> FtBadPixselDetect                    (bad pixel detection/correction)                    [preprocessing]
+  -> FtGrayMeanSub                        (mean subtraction / normalization)                  [preprocessing]
+  -> FtSegmentByLocalVariance             (25 cx, foreground/background segmentation
+                                            -> produces templatePixValid mask)                [preprocessing]
+  -> FtResize_8u                          (9 cx, resize -- direction/factor not yet confirmed) [preprocessing]
+  -> InitSPAImageSize/MaskRadius/ImpactFactors + FtSpaSmooth   (smoothing pass)                [preprocessing]
+  -> FtGetMfsFeatures                     (234 cx, 362 bbs, 17 args -- KEYPOINT DETECTION.
+                                            Logs gAlgInfor.{intvls,sigma,contrThr,curvThr} --
+                                            these are literally Lowe's SIFT parameter names
+                                            [intervals-per-octave, sigma, contrast threshold,
+                                            curvature threshold] -- strong evidence this is a
+                                            SIFT-like DoG scale-space keypoint detector, not a
+                                            classic ridge-ending/bifurcation minutiae detector.)
+  -> FtGenBinImg / FtGenBinImgForSamllSensor / FtRepairGenBinImgForSamllSensor
+                                           (186 / 27 cx -- binarization, WITH AN EXPLICIT
+                                            SMALL-SENSOR-SPECIFIC CODE PATH, confirming the
+                                            vendor built dedicated handling for exactly this
+                                            sensor-size class)
+  -> FtGetMfbFeatures                     (233 cx, 359 bbs, 10 args -- BINARY DESCRIPTOR
+                                            computation per keypoint found above, populating
+                                            ST_Feature.bDescri[8])
+  -> assembled into ST_FocalTemplate
+```
+
+### Honest, now-concrete scope estimate
+Not a small function -- `FtGetTemplate` orchestrates ~10 substantial subroutines. The two heaviest,
+`FtGetMfsFeatures` (SIFT-like detection) and `FtGetMfbFeatures` (binary descriptor), are each comparable in
+size/complexity to `FtVerifyTwoTemplate` itself (~230 cyclomatic complexity, ~360 basic blocks, ~8000 bytes of
+code each). Combined with `FtVerifyTwoTemplate` (348 cx, 548 bbs) for matching, a faithful reimplementation
+means tracing and reproducing roughly a dozen nontrivial functions, several architecturally comparable to a
+full SIFT implementation plus a custom binary descriptor -- this is realistically **weeks, not days**, of
+careful RE + reimplementation + testing, confirming and sharpening (not contradicting) the "real sub-project"
+framing given when this direction was chosen. The DWARF debug info (real names, types, source line numbers)
+meaningfully de-risks correctness during that work, but does not shrink the raw amount of logic involved.
+
+Good news for feasibility: SIFT-like scale-space detection is a well-documented, publicly understood
+algorithm family (unlike a from-scratch mystery algorithm), so the detection stage has strong reference
+material available even though this exact implementation still needs to be traced from the binary. The binary
+descriptor computation (`FtGetMfbFeatures`) and the small-sensor-specific binarization variants are the more
+bespoke, FocalTech-specific parts requiring full RE from the binary with no external reference.
