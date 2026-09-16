@@ -2051,3 +2051,65 @@ plan to validate against real `.so` intermediate buffers (via `gdb`) once enough
 make that comparison meaningful -- that step will also resolve the deferred ambiguities above empirically.
 Continuing to perfect every preprocessing function in isolation before touching the much larger and more
 critical `FtGetMfsFeatures`/`FtGetMfbFeatures` stages would not be the highest-value use of time right now.
+
+## MAJOR FINDING: FtGetMfsFeatures is an adapted OpenSIFT implementation, not bespoke (2026-09-16)
+
+Status: CONFIRMED with high confidence via exact struct-field-name and default-constant correspondence to the
+public OpenSIFT reference implementation (Rob Hess, github.com/robwhess/opensift) -- verified via WebFetch
+against opensift's actual source (`src/sift.c`, `include/sift.h`), not from memory/assumption.
+
+### The decisive match
+`FtGetMfsFeatures`'s real signature (via `gdb ptype`):
+```c
+struct ST_EXTREMUM_NUM { SINT32 nMaxExtremum; SINT32 nMinExtremum; }
+  FtGetMfsFeatures(ST_InputForTemplate inPara, ST_Feature **feat1, ST_Feature **feat2);
+
+struct ST_InputForTemplate {   // 72 bytes
+  SINT32 intvls; FP32 sigma; FP32 contrThr; SINT32 curvThr; SINT32 imgDbl;
+  SINT32 descrWidth; SINT32 descrHistBins; ST_IplImage *img; UINT8 octave;
+  UINT8 validArea; UINT8 *validFlg; UINT8 *badPixselValidFlg; UINT8 isFT9391;
+  UINT8 algType; UINT8 sensorCol; UINT8 isSpeedUp; FP32 imgScale;
+};
+```
+Field names `intvls`, `sigma`, `contrThr`, `curvThr`, `imgDbl`, `descrWidth`, `descrHistBins` are an EXACT match
+to OpenSIFT's `SIFT_INTVLS`/`SIFT_SIGMA`/`SIFT_CONTR_THR`/`SIFT_CURV_THR`/`SIFT_IMG_DBL`/`SIFT_DESCR_WIDTH`/
+`SIFT_DESCR_HIST_BINS` macro names -- not a coincidental naming overlap (7 distinct field names matching in
+both spelling and role is not plausible by chance). The return type's field names (`nMaxExtremum`,
+`nMinExtremum`) match SIFT's own "scale-space extrema" terminology exactly. **FocalTech's implementation is
+very likely a direct adaptation of OpenSIFT (or a shared common ancestor with identical parameter-naming
+conventions), not an independently-designed bespoke algorithm.**
+
+### Real runtime constants, extracted from `.data` (not `.bss` -- these are the actual compiled-in defaults)
+`gAlgInfor` (`ST_FocalAlgInfo`, address `0x211a70`, 16 bytes, in `.data`) holds:
+```
+intvls   = 3       (OpenSIFT default: 3     -- IDENTICAL)
+sigma    = 1.6     (OpenSIFT default: 1.6   -- IDENTICAL)
+contrThr = 0.02    (OpenSIFT default: 0.04  -- HALVED)
+curvThr  = 15      (OpenSIFT default: 10    -- +50%)
+```
+Both deviations from stock OpenSIFT make the detector MORE PERMISSIVE (lower contrast threshold admits more
+candidate keypoints; higher curvature threshold rejects fewer edge-like points) -- a small, well-reasoned,
+understandable customization consistent with compensating for this sensor's tiny 64x80 native resolution,
+not an arbitrary or mysterious tuning choice.
+
+### Practical implication: reference-guided reimplementation, not blind RE
+OpenSIFT's public pipeline (verified from its actual source): `create_init_img` (grayscale + optional 2x
+doubling) -> `build_gauss_pyr` -> `build_dog_pyr` -> `scale_space_extrema` -> `calc_feature_scales` ->
+`adjust_for_img_dbl` -> `calc_feature_oris` -> `compute_descriptors`. Given `FtGetMfsFeatures` returns extrema
+counts and populates two `ST_Feature**` arrays (max/min extrema) but does NOT itself produce the binary
+descriptor (that's `FtGetMfbFeatures`, traced separately), it most likely covers OpenSIFT's stages 1-7
+(through orientation assignment) or a subset ending at localized/oriented extrema, with `FtGetMfbFeatures`
+covering only descriptor computation (using FocalTech's bespoke 256-bit binary descriptor instead of OpenSIFT's
+128-float gradient histogram, per the earlier-confirmed `ST_Feature.bDescri[8]` layout) -- not yet confirmed
+exactly where the split falls, to be resolved via call-graph mapping next.
+
+This substantially de-risks and likely shortens the remaining Step 2/3 work: rather than blind disassembly,
+the plan is now to map `FtGetMfsFeatures`'s real callees against OpenSIFT's known stage names/order, and focus
+RE effort specifically on identifying WHERE FocalTech's implementation matches stock OpenSIFT behavior
+(reusable as-is, verified against public reference) versus where it's been customized for this sensor
+(genuinely needs disassembly-level attention). The `imgDbl` field's actual runtime value (0 or 1) at the real
+call site was not yet pinned down (deferred -- the struct is passed by 9 raw stack pushes, not individually
+labeled in the decompiler output; will resolve via the same intermediate-value validation pass rather than
+hand-mapping 9 push offsets by hand right now), but `FtResize_8u`'s position immediately before this stage in
+the pipeline is strong circumstantial support for `imgDbl=1` (OpenSIFT's `create_init_img` does exactly this
+doubling step when enabled).
