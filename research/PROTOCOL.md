@@ -2505,3 +2505,41 @@ capturing real structure, just not yet usable as a score without the alignment s
 rather than as a pass/fail on the real matcher, since it isn't the real matcher.
 
 ### Next: implement Step 4 (RANSAC + affine fit + FtCalcSimScore) to get a real, meaningful score
+
+## Reimplementation: Step 4 (focal_verify.c) first end-to-end run -- DOES NOT WORK YET, reporting honestly (2026-09-16)
+
+Status: COMPILES, runs end-to-end on all 45 pairs of the real calibrated_set without crashing (one anomalous
+0.0000 result, see below). Reporting the raw result plainly per this project's own rules -- this first-draft
+full pipeline does NOT separate same-finger from different-finger.
+
+### Full 45-pair result (same/different-finger labels from the already-gathered calibrated_set)
+Scores range ~0.75-0.93 across BOTH same-finger and different-finger pairs, heavily overlapping, no usable
+threshold. Examples: same1-vs-same2=0.8126 but same1-vs-diff2=0.8715 (different-finger scored HIGHER); same5-
+vs-same6=0.9210 (same-finger, high) but same6-vs-diff1=0.9048 (different-finger, almost as high). One pair
+(same2-vs-same3) scored exactly 0.0000 -- an anomaly, not yet explained (candidates=54, inliers=9, so a
+transform WAS fit; the zero likely means either validCnt came out 0 for that specific fitted transform, or the
+fitted affine is a degenerate/extreme warp that RANSAC's max-inlier criterion didn't rule out with so few
+candidates -- flagged as unexplained rather than glossed over).
+
+### Honest assessment: several BEST-EFFORT placeholders are the likely culprits, not the core architecture
+This result does not necessarily mean the architecture (confirmed via disassembly: keypoint correspondence +
+RANSAC affine alignment + masked binarized-image agreement) is wrong -- several pieces feeding it are known,
+explicitly-flagged placeholders rather than the real traced algorithm:
+1. `binarize_local_mean` is used for BOTH the validity mask and the ridge binarization in this first draft.
+   Thresholding at the local mean classifies roughly half of ANY image (including pure background/noise) as
+   "valid foreground" -- it is not a real segmentation, unlike the already-CONFIRMED
+   `focal_segment_by_local_variance` (in `focal_match.c`) which was NOT yet wired into `focal_verify.c`. This
+   likely dilutes the real ridge-agreement signal with essentially-random background agreement.
+2. The images fed into `focal_verify_two_templates` are only percentile-normalized raw captures -- they have
+   NOT been run through the actual traced Step 1 preprocessing chain (contrast enhancement, segmentation-aware
+   equalization) before feature extraction or binarization, unlike the real pipeline.
+3. RANSAC's candidate threshold (Hamming <=90) and inlier threshold (6px) are unvalidated guesses, not derived
+   from anything traced.
+4. Step 2-3 (`focal_sift.c`) itself has not been validated against the real `.so`'s actual intermediate output
+   (per the original validation plan) -- a real bug there would silently propagate into this result too.
+
+### Next concrete action
+Wire the already-CONFIRMED `focal_segment_by_local_variance` in as the validity mask (item 1 above -- cheapest,
+most likely to matter, already-correct code sitting unused in `focal_match.c`) before investigating anything
+else, then re-run the same 45-pair test and report the new result plainly, per this project's own "don't keep
+tweaking without reporting real results" discipline.
