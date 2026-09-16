@@ -1068,6 +1068,19 @@ int main(void)
     int avg_middle = img_get_avg_middle(image_buf, (int)sizeof(image_buf));
     printf("== Img_Get_Avg_Middle() = %d ==\n", avg_middle);
 
+    /* STEP 4 test: re-run fdt_get_a_frame_data() (the small 8-byte
+     * calibration frame read, addr 0xb8) now that a full img_scan
+     * (img_scan_start's arming sequence) has already run above -- earlier
+     * in this session it returned all zeros when tested chronologically
+     * BEFORE any scan-arming had occurred. Testing the hypothesis that it
+     * needs that arming trigger first. */
+    printf("\n== STEP 4 retest: fdt_get_a_frame_data() AFTER a real scan has already run ==\n");
+    unsigned char frame_buf2[8] = {0};
+    fdt_get_a_frame_data(h, frame_buf2);
+    hexdump("  frame_buf2 after byte-swap", frame_buf2, sizeof(frame_buf2));
+    int fail_result2 = fdt_base_fail_check(frame_buf2);
+    printf("  fdt_base_fail_check() on retest: %d (%s)\n", fail_result2, fail_result2 == 0 ? "PASS" : "FAIL");
+
     libusb_release_interface(h, 0);
     libusb_close(h);
     libusb_exit(ctx);

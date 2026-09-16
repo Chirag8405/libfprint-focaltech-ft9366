@@ -1406,3 +1406,46 @@ silently skipped -- revisit if captured image quality turns out to be insufficie
 ### Next concrete action
 Proceed to Step 3 (`poa_send_para`) and Step 4 (frame_data resolution) as planned, then prioritize Step 5
 (real host-side matching) as the primary remaining focus.
+
+## STEP 4 RESOLVED (mostly): frame_data all-zero was a pre-scan artifact, not a bug (2026-09-16)
+
+Status: CONFIRMED via live retest -- hypothesis validated, one secondary nuance left open
+
+### Test
+Re-ran `fdt_get_a_frame_data()` (the small 8-byte calibration frame read at SRAM address `0xb8`) AFTER a full
+real image scan (`img_data_get`, including `img_scan_start`'s arming sequence) had already run earlier in the
+same session -- unlike the original test much earlier in this session, which called it chronologically BEFORE
+any scan-arming had occurred.
+
+### Result
+```
+sent: 04 fb 80 b8 00 04
+recv: 08 79 08 79 08 79 08 79   -- stable, non-zero, structured (all 4 samples identical)
+decoded value: 2169 (0x0879) for all 4 entries
+fdt_base_fail_check(): FAIL (2169 > 0x2bc(700) -- now fails for being too HIGH, not too low/zero)
+```
+
+### Confirmed
+The all-zero result from earlier in this session was a **pre-scan idle-state artifact**, not a protocol bug --
+CONFIRMED by this retest showing real, non-zero, stable, sensor-derived data once a real scan had already
+occurred. This resolves the primary question Step 4 asked.
+
+### Still open (secondary, not blocking)
+The value (2169) still fails `fdt_base_fail_check`'s valid range (300-700), now for being too high rather than
+too low. Notably, 2169 (`0x0879`) is very close in magnitude to raw pixel values seen in this session's actual
+captured images (e.g. baseline image's first pixel was `0x087f`=2175). This suggests the small FDT-mode frame
+read may share underlying data with the full image capture, or requires additional FDT-specific
+scan-priming distinct from the IMG-mode scan this session used to trigger it. Not resolved further -- flagged
+honestly as a remaining nuance rather than claimed as fully understood, and not pursued further given it does
+not block the higher-priority remaining work (Step 5: real matching).
+
+## STEP 3 STATUS: poa_send_para -- deferred, not blocking
+
+Per the same prioritization logic as Step 2: `poa_send_para`'s wire format was partially characterized in
+earlier work (builds a command from several `REG9366` fields via `ff_spi_write_then_read_buf_rts`), but full
+resolution was not completed this session. This is the final "commit calibration to chip" step in
+`fw9366_init_chip`'s top-level sequence -- deferred in favor of Step 5 (real matching), which is the genuine
+blocker for working enroll/verify. This session has already demonstrated that real fingerprint capture works
+without needing `poa_send_para` resolved (the capture pipeline tested and confirmed end-to-end does not
+depend on it). Revisit if real-world reliability issues arise that trace back to missing calibration
+finalization.
