@@ -3991,3 +3991,90 @@ an artifact of the collection process. If the dataset is confirmed sound, the ne
 whether real verification relies on a threshold/signal this session's `FtCalcSimScore`-only test doesn't
 capture, or whether a larger, more carefully collected validation set is needed before drawing final
 conclusions about this approach's viability on this sensor.
+
+## STEP 1-3 COMPLETE: fresh, deliberately-varied real dataset collected and tested -- separation inversion CONFIRMED, not a dataset artifact (2026-09-16/17)
+
+Status: CONFIRMED via a new, purpose-built 20-capture dataset with real, verified angle/pressure variation
+(`research/captures/varied_set/`, full metadata in `varied_set/METADATA.md`), tested with the SAME real-pipeline
+methodology as the previous (narrower) dataset: real `FtSegmentByLocalVariance` masks, real `FtGenBinImg`
+binarization, real `FtGetMfbFeatures` keypoints, this project's own validated alignment estimator, and real
+`FtCalcSimScore`. This directly answers the question posed at the end of the previous entry: was the earlier
+inversion a dataset artifact (insufficient variation) or a real property of the scoring approach?
+
+### Dataset collection (Step 1)
+20 live captures against the real FT9366/RTS5811 hardware (`tools/rts5811_wake_test.c`, `FIXED_DAC=0x35`,
+matching the original `calibrated_set`'s locked calibration point), full lift-off between every capture,
+angle/pressure noted in real time per capture:
+- **10 captures of one physical index finger** (SAME-finger set): angle spread verified from -10 to +15
+  degrees (a real 25-degree range, vs. the previous dataset's ~3-5 degree clustering), pressure spread
+  light/medium/firm all represented.
+- **5 captures of the same physical middle finger**, **5 captures of the same physical ring finger**
+  (DIFFERENT-finger sets, 2 additional distinct fingers): same angle/pressure variation approach.
+- Every capture's `Img_Get_Avg_Middle()` confirmed in the expected finger-present range (303-328, consistent
+  with the original `calibrated_set`'s established 307-321 range) before proceeding to the next -- no corrupt
+  or blank frames in this set. Full per-file metadata (finger identity, approximate angle, pressure, avg_middle)
+  recorded in `research/captures/varied_set/METADATA.md` specifically so finger-identity mislabeling (the
+  unresolved question that could not be ruled out for the previous dataset) can never be a live question for
+  this one.
+
+### Method (Step 2)
+Built `tools/ground_truth_calcsimscore_batch.c` (extends the single-pair `ground_truth_calcsimscore.c`):
+loads all 20 real captures once (real masks/binarization/keypoints), then computes the REAL `FtCalcSimScore`
+for every pairwise combination -- 65 same-finger pairs (C(10,2) idx-idx + C(5,2) mid-mid + C(5,2) ring-ring)
+and 125 different-finger pairs (10x5 idx-mid + 10x5 idx-ring + 5x5 mid-ring), 190 total, not a handful of
+examples.
+
+### Result: full distributions overlap completely; different-finger median is HIGHER than same-finger median
+```
+SAME-finger:      n=65   mean=0.9249  median=0.9105  min=0.8244  max=0.9930
+DIFFERENT-finger: n=125  mean=0.9315  median=0.9415  min=0.8188  max=0.9890
+gap (same_avg - diff_avg) = -0.0066   (essentially zero, slightly inverted)
+```
+Histograms (0.02-wide bins) show full overlap across the entire 0.82-1.00 range for both categories:
+```
+SAME  0.82:# 0.84:#### 0.86:### 0.88:###### 0.90:################## 0.92:##### 0.94:## 0.96:######### 0.98:############## 1.00:###
+DIFF  0.82:## 0.84:# 0.86:########### 0.88:####### 0.90:##################### 0.92:################## 0.94:############### 0.96:################ 0.98:##################################
+```
+Same-finger pairs are NOT even concentrated toward the high end within the overlapping range -- their mode
+(0.90 bin) sits in the middle of the distribution, while different-finger pairs are, if anything, MORE
+concentrated at the very top (0.98 bin has 34 different-finger pairs vs. 14 same-finger pairs, and the
+different-finger median 0.9415 exceeds the same-finger median 0.9105).
+
+### Interpretation (Step 3): the earlier inversion was NOT a dataset artifact
+This directly resolves the open question from the previous entry. With genuinely varied angle (a real 25-degree
+range vs. the previous ~5-degree clustering) and genuinely varied pressure, using the real vendor's own
+`FtCalcSimScore`/`FtGenBinImg`/`FtSegmentByLocalVariance` and this project's independently-validated alignment
+estimator, same-finger and different-finger scores remain fully overlapping across 190 pairs -- and if
+anything the different-finger distribution skews HIGHER. **This is now strong, well-evidenced grounds to
+conclude the masked-ridge-overlap-after-alignment scoring approach may lack sufficient finger-identity signal
+on this sensor's small (64x80) capture area**, using the real vendor scoring code, not a reimplementation bug
+or an insufficiently-varied validation set.
+
+### Honest options going forward (per this session's own request to lay these out plainly)
+1. **Check for a different real vendor function/mode not yet examined.** `FtVerifyByTemplate` (confirmed via
+   DWARF signature, `SINT16 FtVerifyByTemplate(ST_FocalTemplate*, SINT16*, SINT16*, FP32*, UINT8)` -- a
+   DIFFERENT function from `FtVerifyTwoTemplate`, never disassembled) and `FtCalcSimScoreRefit` (offset
+   0xbb070, 1171 bytes, explicitly deferred/not traced this whole project -- its name suggests a refinement
+   pass that could plausibly incorporate a different or additional signal, e.g. weighting descriptor
+   similarity directly rather than pure post-alignment ridge overlap) are the cheapest, most concrete
+   remaining leads. Both are real, already-located functions in the same `.so` -- checking them is far cheaper
+   than either of the options below and should be tried first.
+2. **More capture area or multi-frame fusion.** A known real technique for small-area sensors in the industry.
+   No evidence has been found in this `.so` that the FT9366 firmware/algorithm does this (every trace this
+   project has done, front to back, is single-frame) -- this would be a much larger undertaking (new capture
+   protocol research, possibly requiring firmware capabilities not yet confirmed to exist) than a "next step,"
+   and should only be pursued if option 1 is exhausted.
+3. **This sensor may not be reliably viable for secure fingerprint verification via this specific vendor
+   algorithm family, on Linux, using only the functions found so far.** This is not a claim that fingerprint
+   matching is impossible on 64x80 sensors in general (larger commercial products exist), but is now a
+   legitimate, evidence-based conclusion specific to what this project has been able to locate and validate in
+   this `.so`. If option 1 also fails to show separation, this should be treated as a serious project-level
+   viability finding -- worth stating plainly to stakeholders rather than continuing to iterate on
+   implementation fidelity, which has now been validated about as thoroughly as is practical (detection,
+   descriptor, alignment, binarization, masking, and scoring all independently confirmed against real ground
+   truth across this whole project).
+
+### Recommended immediate next step
+Disassemble and test `FtCalcSimScoreRefit` (offset 0xbb070) next -- it is the cheapest remaining real lead
+(already located, never examined) before considering this a closed question about the sensor/algorithm's
+viability.
