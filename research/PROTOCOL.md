@@ -2887,3 +2887,34 @@ Real dumped feature data (position, orientation, 256-bit descriptor) saved to
 Diff this real ground truth against `focal_sift.c`'s output on the same images (keypoint positions/counts,
 then descriptor agreement for any positionally-matching keypoints) to precisely localize the reimplementation's
 remaining divergence, per this continuation's original Step 2-3 plan.
+
+## PRECISE LOCALIZATION: detection is correct, descriptor computation is the bug (2026-09-16)
+
+Status: CONFIRMED via direct diff against real ground truth (`tools/diff_ground_truth.c` comparing
+`focal_sift.c`'s output against `research/ground_truth/same5_real.txt` on the same image).
+
+### Detection/localization: CONFIRMED CORRECT
+90% (37/41) of my reimplementation's keypoints land within 3px of a real keypoint on the same image, most
+within a fraction of a pixel (e.g. mine[25] at (20.5,11.8) vs real[9] at (20.5,11.8), dist=0.02px;
+mine[26] at (67.8,40.3) vs real[119] at (67.8,40.3), dist=0.05px). Average nearest-neighbor distance across
+all 41 of my keypoints: 0.91px. **This confirms the OpenSIFT-derived pyramid/DoG/Taylor-interpolation
+detection pipeline (Step 2) is fundamentally correct** -- the earlier line-by-line audit's two fixes plus the
+96x96/1.5x geometry correction were evidently enough to get real, accurate localization.
+
+### Descriptor computation: CONFIRMED WRONG, even at exact position+orientation matches
+Despite near-perfect position agreement, descriptor Hamming distances at matched locations are mostly HIGH
+(many 150-250+ out of 256, i.e. WORSE than the ~128 expected for random/independent bits) rather than low.
+Decisive example: `mine[28]` at `(62.5,45.6)`, `ori=-0.33` vs `real[66]` at `(62.5,45.6)`, `ori=-0.31` --
+position agrees to 0.07px, orientation agrees to 0.02 rad (1.1 degrees), yet **Hamming distance = 146/256**.
+Since position AND orientation are both essentially exact matches here, the wrong descriptor value cannot be
+explained by a localization or orientation-assignment error -- it must be in the descriptor SAMPLING/
+COMPARISON logic itself (`compute_binary_descriptor` in `focal_sift.c`), i.e. Step 3, not Step 2.
+
+### Leading hypothesis: rotation-direction sign error in the steered sampling
+`compute_binary_descriptor` rotates each `coordinarePairs` offset by the keypoint's orientation using the
+standard counter-clockwise rotation matrix (`rx = dx*cos-dy*sin`, `ry = dx*sin+dy*cos`). If the real algorithm
+uses the opposite rotation direction (clockwise) or a different sign/reference convention for "ori" than
+OpenSIFT's `atan2(dy,dx)`-with-y-flip (a classic image-row-vs-math-Y-axis source of exactly this kind of sign
+confusion), every sampled point would be reflected to the WRONG side of the keypoint even with perfectly
+correct position/orientation -- consistent with the observed worse-than-random Hamming distances at exact
+position+orientation matches. Testing this directly next.
