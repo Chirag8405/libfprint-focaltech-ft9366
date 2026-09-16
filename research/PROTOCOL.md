@@ -3633,3 +3633,82 @@ under a KNOWN real transform (if obtainable) or at minimum audit the extrema-ref
 histogram code against OpenSIFT's reference behavior with the same line-by-line rigor already applied to
 `FtNonLinearStretch_U8` and `FtLocalContrastEnhance`, to determine whether detector-own instability is a fixable
 bug or an inherent property of this approach at this resolution.
+
+## DECISIVE: real algorithm vs. this reimplementation's rotation-repeatability, ground-truth compared (2026-09-16)
+
+Status: CONFIRMED via direct real-.so ground truth (not inference). This resolves the open question from the
+previous entry: excess rotation-instability in this reimplementation's detection stage is a REAL, FIXABLE BUG,
+not an inherent limitation of DoG-based detection at this sensor's resolution.
+
+### Method
+Extended the `ground_truth_dump2.c` technique (direct `FtGetMfbFeatures` call via dlopen+bias, bypassing
+`FtGetTemplate`'s device-init dependencies) into `tools/ground_truth_rotation_repeatability.c`: apply the exact
+same synthetic rigid transforms used in `test_synthetic_repeatability.c` to a real capture's tight 64x80 image
+BEFORE padding into the 96x96 canvas, call the REAL algorithm's detector on both the identity and transformed
+canvas, and measure what fraction of the identity call's keypoints land within 3px of some keypoint in the
+transformed call's output (using the exact known transform, no search needed).
+
+### Result: the real algorithm is dramatically more rotation-repeatable than this reimplementation, on the SAME images and SAME transforms
+```
+                    identity  dx=2   dy=2   th=2   th=3   th=5   dx2,dy1,th3   dx-1,dy2,th-2
+same5.raw  REAL:     99.4%   98.8%  97.5%  93.1%  88.1%  88.1%     85.6%          90.0%
+same5.raw  OURS:     97.8%   93.3%  93.3%  77.8%  80.0%  64.4%     68.9%          84.4%
+
+same1.raw  REAL:     98.1%   96.9%  97.5%  91.9%  90.0%  89.4%     90.0%          88.8%
+same1.raw  OURS:    100.0%   96.3%  87.0%  72.2%  83.3%  70.4%     79.6%          81.5%
+
+diff2.raw  REAL:     96.9%   95.6%  97.5%  90.6%  90.6%  85.0%     90.0%          86.9%
+diff2.raw  OURS:     91.4%   82.9% 100.0%  91.4%  82.9%  65.7%     82.9%          82.9%
+```
+At identity/pure-translation, the two are comparably good (both 87-100%). **Under rotation specifically, the
+gap widens sharply and consistently**: at 5 degrees, the real algorithm stays at 85-89% while this
+reimplementation drops to 64-71% -- a 15-24 percentage point gap, reproduced independently on three different
+real captures. This directly confirms the earlier synthetic-diagnostic finding (this reimplementation's own
+rotation-sensitivity) is NOT matched by the real algorithm under the same conditions -- the real FocalTech
+detector, on the same sensor, same resolution, same fundamental DoG-based approach, achieves meaningfully
+better rotation repeatability. This rules out "inherent sensor/resolution limitation" as the explanation and
+confirms a real, specific, fixable gap in this reimplementation's own detection code.
+
+### Notable structural finding: the real algorithm's keypoint count is a hard-capped, fixed 160 in every test
+`nMaxExtremum + nMinExtremum` summed to EXACTLY 160 in all three base images tested (93+67, 90+70, 95+65),
+regardless of image content or synthetic transform. This is very likely `gSensorInfor.maxKpNum=160` (confirmed
+in an earlier session) acting as a hard cap with some strength-based selection when more than 160 raw candidates
+are found. This reimplementation has no equivalent cap or selection mechanism at all -- but since this
+reimplementation's own raw output (35-59 total keypoints) is already well BELOW 160, simply adding a "keep top
+160" cap would not change anything here; this reimplementation is UNDER-producing candidates relative to the
+real algorithm's raw (pre-cap) pool, not over-producing marginal ones that need trimming. This rules out "missing
+a selection/capping step" as a complete explanation on its own, though it may still interact with the real
+explanation below.
+
+### Structural audit of the detection code: no logic bug found
+Read `interp_step`, `deriv_3D`/`hessian_3D` (central-difference derivatives), `is_extremum`,
+`scale_space_extrema`'s convergence loop, and `calc_feature_oris`/`ori_hist` line-by-line against the OpenSIFT
+reference algorithm they were built from. All match structurally: the sub-pixel Taylor-expansion refinement
+loop, the 0.5-offset convergence criterion, the `SIFT_MAX_INTERP_STEPS=5` iteration cap, and the orientation
+histogram/smoothing/peak-interpolation logic are all direct, correct transcriptions with no algorithmic
+deviation found. `FOCAL_CONTR_THR=0.02` is independently CONFIRMED (not guessed) via real disassembly of
+`gAlgInfor.contrThr`, so it should not be treated as a free tuning parameter to explain this gap away.
+
+### Leading hypothesis (not newly tested this pass, already partially substantiated by earlier ground truth): pyramid numerical precision
+An earlier entry this session ("STEP 1-2 RESULT: found a second real error... pyramid CONTENT is actually very
+close") already found, via direct row/column-level comparison of real vs. reimplementation `gauss_pyr` content,
+that this reimplementation's pyramid is systematically SHARPER than the real algorithm's (steeper edges,
+~1px-earlier rising-edge crossing, slightly higher peak values) despite already applying a bicubic (not
+bilinear) img_dbl upscale fix. Sharper local image content produces DoG extrema that sit closer to
+threshold/neighbor-comparison boundaries and are geometrically more fragile -- exactly the kind of numerical
+property that would make extrema appear, disappear, or shift under a few degrees of rotation more often than a
+correctly-blurred (flatter-response) pyramid would. This is the most likely specific mechanism connecting an
+already-confirmed, still-not-fully-resolved discrepancy to the newly-confirmed rotation-repeatability gap, but
+this session did not re-verify it against fresh ground truth -- flagging as the leading hypothesis, not a
+re-confirmed fact.
+
+### Honest status and recommended next step
+The open question from the previous entry is now resolved: this reimplementation's detection stage has a real,
+fixable bug (confirmed against real ground truth, not assumed), not an inherent sensor limitation. The bug's
+exact numerical origin is narrowed to pyramid-construction precision (most likely candidate) but not
+re-confirmed with fresh ground truth this pass -- structural review of the detection/orientation LOGIC found no
+error, so the remaining discrepancy is most likely in a numerical DETAIL of blur/interpolation, not the
+algorithm's structure. Next concrete step: extract fresh real `gauss_pyr` ground truth at a SECOND, deeper
+octave/interval (not just the img_dbl stage already checked) and diff precisely, to determine whether the
+sharpness discrepancy originates in the initial doubling stage specifically or compounds through
+`build_gauss_pyr`'s own per-level blur.
