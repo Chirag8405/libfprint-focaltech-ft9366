@@ -12,6 +12,7 @@
  */
 #include <libusb-1.0/libusb.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -994,10 +995,21 @@ int main(void)
      * bytes for param=0->1), distinct from the small 8-byte calibration
      * "frame data" tested earlier. First test run with no finger placed,
      * to establish a baseline before any touch-based comparison. */
-    printf("\n== fw9366_img_data_get(param=0) -- REAL IMAGE CAPTURE (baseline, no finger) ==\n");
+    printf("\n== fw9366_img_data_get(param=0) -- REAL IMAGE CAPTURE ==\n");
     static unsigned char image_buf[10240];
     img_data_get(h, image_buf, 0);
     printf("== image capture complete ==\n");
+
+    const char *out_path = getenv("IMAGE_OUT_PATH");
+    if (out_path == NULL) out_path = "/tmp/last_capture.raw";
+    FILE *f = fopen(out_path, "wb");
+    if (f) {
+        fwrite(image_buf, 1, sizeof(image_buf), f);
+        fclose(f);
+        printf("== saved full %zu-byte capture to %s ==\n", sizeof(image_buf), out_path);
+    } else {
+        printf("== FAILED to save capture to %s ==\n", out_path);
+    }
 
     libusb_release_interface(h, 0);
     libusb_close(h);

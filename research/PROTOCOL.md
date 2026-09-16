@@ -1211,3 +1211,51 @@ captures against each other (the finger was not actually present during either c
 synchronization mix-up) and showed only noise-level differences, as expected for two baseline reads. Corrected
 by explicitly confirming finger placement before triggering, same as prior live hardware coordination in this
 session.
+
+## MAJOR MILESTONE: fingerprint ridge pattern visually confirmed in captured data (2026-09-16)
+
+Status: CONFIRMED visually, with honest caveats on exact dimension confirmation
+
+### Method
+Two properly-synchronized captures were taken with `IMAGE_OUT_PATH` set to save the full 10240-byte raw
+buffer (not just the truncated console preview): one with no finger present (baseline), one with finger
+confirmed resting on the sensor before the capture was triggered (touch). Both saved to
+`research/captures/2026-09-16-{baseline-nofinger,touch-confirmed}.raw`.
+
+### Statistical comparison (full 5120-sample buffers, u16 big-endian)
+```
+baseline: min=0 max=3580 avg=2563.5
+touch:    min=0 max=2955 avg=1884.2
+diff:     min=-972 max=0 avg=-679.4   -- EVERY sample decreased, never increased
+samples with |diff|>200: 4960/5120 (96.9%)
+```
+This is a massive, one-directional, near-universal shift -- not noise (an earlier, improperly-synchronized
+comparison of two no-finger baselines showed only single-digit differences).
+
+### Visual reconstruction
+Reshaping the difference data as a 2D image, multiple candidate widths were tried (5120 total samples
+factors cleanly into several aspect ratios). Width=64 (giving 64x80) produced a clearly recognizable
+fingerprint ridge pattern -- flowing, naturally curved, roughly-parallel lines consistent with real ridge/
+valley structure, including what appears to be ridge convergence structure. This was corroborated by
+doubling the width (128x40) showing the exact same pattern repeated twice, and halving it (32x160) also
+showing the pattern repeating -- strong evidence 64 is the true row width, not a coincidental reshape.
+
+Saved: `research/captures/2026-09-16-ridge-pattern-diff-64x80.png` (contrast-enhanced, 2nd-98th percentile
+stretch, upscaled for visibility).
+
+### Honest assessment
+CONFIRMED: real, substantial, spatially-structured signal correlated with physical touch, visually consistent
+with fingerprint ridge/valley topology, obtained via this session's fully independently-derived (reverse
+engineered from scratch, zero reliance on the proprietary binary at runtime) protocol implementation.
+
+NOT independently confirmed: the exact true sensor resolution/orientation (64x80 is strongly evidence-backed
+via the repeat-pattern test, but not confirmed against any authoritative spec), whether this is the raw
+sensor's native pixel grid or requires further deinterleaving/correction, and how this diff-based
+reconstruction relates to what a single raw (non-differenced) capture would need for real enrollment (which
+presumably works from one capture, not a before/after diff -- the "baseline subtraction" logic already seen
+in `fdt_base_Min_Updata` hints the real firmware does something conceptually similar itself).
+
+This is not yet a working `fprintd-enroll`/`fprintd-verify` -- reaching that requires the remaining protocol
+stages (AutoSDacUpdate calibration feedback, `poa_send_para`, and likely template extraction/matching, which
+may be match-on-chip and not yet located). But this is the clearest, most direct evidence so far that this
+project's reverse-engineered protocol can pull real, meaningful fingerprint data off the sensor.
