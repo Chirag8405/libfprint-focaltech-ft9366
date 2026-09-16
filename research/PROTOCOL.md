@@ -663,3 +663,23 @@ now corrected before further integration, per session ground rules.
 Since invocations A2 and B are both confirmed no-ops for `fdt_mode_init` specifically, **no further state
 mapping is needed for those two call paths** -- they contribute nothing beyond a log line. All further tracing
 of `fdt_mode_init`'s body should proceed from invocation A1's state only.
+
+## Update: invocation A1 sequence corrected and re-tested clean (2026-09-16)
+
+Status: CONFIRMED, tested live against real hardware, zero timeouts
+
+Per the Step 1 state map above, `tools/rts5811_wake_test.c` updated to include the previously-missed
+`sram_write(0x180c, 0x0000)` in its correct position (between the `0x1801` and `0x1881` writes), using the
+now-confirmed `AUTO_DAC_PRO_FLAG=1` branch rather than the `==0` branch.
+
+Live test, all three writes clean:
+```
+sram_write(0x1801, 0xfc9b) -> 05 fa 98 01 00 01 fc 9b
+sram_write(0x180c, 0x0000) -> 05 fa 98 0c 00 01 00 00
+sram_write(0x1881, 0x0f0c) -> 05 fa 98 81 00 01 0f 0c
+```
+
+This is now confirmed complete for invocation A1 up to the point `fdt_mode_init` sets
+`fw9366_context[0xfc]=0xa1` (a host-side-only state write, no wire effect). Still not integrated: the
+`fw9366_img_mode_init(0)` call (which the real sequence makes BEFORE these three writes) and the remaining
+~60% of `fdt_mode_init`'s body after this point.

@@ -367,43 +367,53 @@ int main(void)
         printf("\n== chipid sram_read transfer failed/timed out ==\n");
     }
 
-    /* --- fw9366_fdt_mode_init() -- OPENING SEQUENCE ONLY, traced from
-     * 0x155f7d (8870 bytes total, only the first ~40% covered). This is
-     * called from fw9366_fdt_manual_start(), which is called from
-     * fw9366_fdt_base_Stable_Update() (part of fw9366_Update_Base's call
-     * tree). Confirmed opening sequence:
-     *   fw9366_idle_enter()                          -- fully resolved, tested below
-     *   if (REG9366[0x77]==0) fw9366_img_mode_init(0) -- REG9366[0x77] IS 0 per
-     *       fw9366_init_flag (already confirmed), so this call WILL happen in
-     *       the real sequence, but img_mode_init itself (3074 bytes) has NOT
-     *       been traced yet -- deliberately NOT called here, see note below.
-     *   sram_write(0x1801, sram_bits_set(0xfc80, hi=6, lo=0, new=REG9366[0x89]))
-     *     = sram_write(0x1801, 0xfc9b)  -- REG9366[0x89]=0x1b confirmed via
-     *       fw9366_init_flag (Fw9366_cfg[2]=1 branch, already traced)
-     *   sram_write(0x1881, sram_bits_set(sram_bits_set(0, hi=15,lo=8,new=15),
-     *                                     hi=4,lo=2,new=3))
-     *     = sram_write(0x1881, 0x0f0c)  -- period=1000/Fw9366_cfg[3]-1=15
-     *       (Fw9366_cfg[3]=0x3c confirmed), Fw9366_cfg[5]-1=3 (cfg[5]=0x04
-     *       confirmed); fw9366_context[0xf8] confirmed NEVER written anywhere
-     *       in this binary (permanently 0 from .bss), so the Fw9366_cfg[3]
-     *       path (not [4]) is confirmed taken, not assumed.
+    /* --- fw9366_fdt_mode_init() -- INVOCATION A1 ONLY, per the full
+     * call-site/state map in research/PROTOCOL.md (built BEFORE this code,
+     * not alongside it). Of the 4 call sites in the binary, only 2 are
+     * reachable from the real init chain, and of those, only the FIRST
+     * invocation (from inside fw9366_fdt_AutoSDacUpdate's internal call to
+     * fdt_manual_start) does real work -- the other two reachable
+     * invocations are confirmed no-ops (fdt_mode_init's own state guard on
+     * fw9366_context[0xfc] short-circuits them to a single log line). So
+     * this IS the complete, correct opening sequence for the one call path
+     * that matters, not a partial/arbitrary subset.
      *
-     * NOT testing further into fdt_mode_init from here: the function calls
-     * fw9366_img_mode_init(0) BEFORE these sram_writes in the real sequence,
-     * and skipping it would make this test diverge from the real init order.
-     * img_mode_init is untraced (3074 bytes) -- this is the actual next
-     * concrete blocker, not scope size alone: correctly continuing requires
-     * either tracing it or accepting a test that's known to skip a required
-     * real step. Reporting both pieces honestly rather than merging them. */
-    printf("\n== fw9366_fdt_mode_init() OPENING SEQUENCE (partial -- see comments) ==\n");
+     * CORRECTED from the previous session's test: a sram_write(0x180c, ...)
+     * gated by AUTO_DAC_PRO_FLAG was missed entirely. At the real invocation
+     * point AUTO_DAC_PRO_FLAG=1 (set by AutoSDacUpdate moments before this
+     * call) and FW9366_LAST_AUTO=0xaa (a real compiled-in .data default, not
+     * zero) -- the code superficially reads as if AUTO_DAC_PRO_FLAG==0 is
+     * the default/normal path, but it is NOT at this invocation. Full
+     * resolved sequence:
+     *   fw9366_idle_enter()
+     *   if (REG9366[0x77]==0): img_mode_init(0)   -- WILL run here in the
+     *       real sequence (REG9366[0x77]=0 confirmed); img_mode_init itself
+     *       (3074 bytes) is the next untraced piece -- deliberately NOT
+     *       called here yet, same honest-gap policy as before.
+     *   sram_write(0x1801, 0xfc9b)
+     *   if (FW9366_LAST_AUTO(0xaa) != AUTO_DAC_PRO_FLAG(1)):     [true]
+     *     if (AUTO_DAC_PRO_FLAG(1) == 0): ...                    [false, so:]
+     *     else: sram_write(0x180c, sram_bits_set(0,hi=0xa,lo=0,new=0))
+     *         = sram_write(0x180c, 0x0000)
+     *     FW9366_LAST_AUTO = AUTO_DAC_PRO_FLAG   (host-side only, no wire effect)
+     *   sram_write(0x1881, 0x0f0c)
+     *   fw9366_context[0xfc] = 0xa1   (host-side only, no wire effect;
+     *       this is what makes invocations A2/B into no-ops)
+     *
+     * Still not testing past this point: the rest of fdt_mode_init's body
+     * (~60%) is unmapped, and img_mode_init (3074 bytes) is still untraced --
+     * both real next steps, not being skipped silently. */
+    printf("\n== fw9366_fdt_mode_init() INVOCATION A1 -- corrected, complete for this call path ==\n");
     printf("-- idle_enter() --\n");
     idle_enter(h);
     printf("-- [NOT CALLED: fw9366_img_mode_init(0) -- untraced, 3074 bytes; REG9366[0x77]==0 so real driver WOULD call this here] --\n");
-    printf("-- sram_write(0x1801, 0xfc9b) [fully resolved value, see comment above] --\n");
+    printf("-- sram_write(0x1801, 0xfc9b) --\n");
     sram_write(h, 0x1801, 0xfc9b);
-    printf("-- sram_write(0x1881, 0x0f0c) [fully resolved value, see comment above] --\n");
+    printf("-- sram_write(0x180c, 0x0000) [CORRECTED: AUTO_DAC_PRO_FLAG=1 branch, not the ==0 branch] --\n");
+    sram_write(h, 0x180c, 0x0000);
+    printf("-- sram_write(0x1881, 0x0f0c) --\n");
     sram_write(h, 0x1881, 0x0f0c);
-    printf("\n== NOTE: this is a PARTIAL, out-of-order test (img_mode_init skipped) -- report is for wire-level sanity (do the writes complete cleanly) only, not for \"is fdt_mode_init working\" ==\n");
+    printf("\n== NOTE: this is invocation A1's confirmed sequence up to the point fdt_mode_init sets context[0xfc]=0xa1; img_mode_init(0) and the remaining ~60%% of fdt_mode_init's body are still not integrated ==\n");
 
     libusb_release_interface(h, 0);
     libusb_close(h);
