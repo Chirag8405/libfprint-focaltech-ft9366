@@ -36,6 +36,14 @@
 #define FOCAL_CONTR_THR 0.02   /* half of OpenSIFT's stock 0.04 */
 #define FOCAL_CURV_THR  15     /* OpenSIFT's stock is 10 */
 #define FOCAL_IMG_DBL   1      /* strong indirect evidence, see PROTOCOL.md */
+/* CONFIRMED via real .so ground truth (research/PROTOCOL.md, "MAJOR
+ * GROUND-TRUTH FINDING"): the real algorithm's working canvas is a FIXED
+ * 96x96 (gSensorInfor.sensorCols/sensorRows), NOT this sensor's native
+ * 64x80 wire resolution, and the "doubled" scale factor is 1.5x (96->144,
+ * verified via both live struct inspection and disassembly arithmetic:
+ * round(dim*3/2)), NOT OpenSIFT's stock 2x. */
+#define FOCAL_WORKING_CANVAS 96
+#define FOCAL_DBL_SCALE 1.5
 
 /* ---- OpenSIFT stock constants not confirmed to be overridden ---- */
 #define SIFT_INIT_SIGMA        0.5
@@ -141,8 +149,15 @@ static FImage *create_init_img(const unsigned char *src, int rows, int cols,
     for (i = 0; i < rows * cols; i++) gray->data[i] = (float)src[i];
 
     if (img_dbl) {
-        double sig_diff = sqrt(sigma * sigma - SIFT_INIT_SIGMA * SIFT_INIT_SIGMA * 4);
-        FImage *dbl = resize_bilinear(gray, rows * 2, cols * 2);
+        /* CONFIRMED real scale factor is 1.5x, not OpenSIFT's stock 2x
+         * (research/PROTOCOL.md). Generalizing OpenSIFT's sig_diff formula
+         * (originally sqrt(sigma^2 - (INIT_SIGMA*2)^2) for exactly 2x) to
+         * an arbitrary scale s: the pre-existing blur's effective sigma
+         * scales by s once resampled onto the enlarged grid, so
+         * sig_diff = sqrt(sigma^2 - (INIT_SIGMA*s)^2). */
+        double s = FOCAL_DBL_SCALE;
+        double sig_diff = sqrt(sigma * sigma - SIFT_INIT_SIGMA * s * SIFT_INIT_SIGMA * s);
+        FImage *dbl = resize_bilinear(gray, (int)lround(rows * s), (int)lround(cols * s));
         gaussian_blur_f(dbl, sig_diff);
         img_free(gray);
         return dbl;
@@ -422,9 +437,9 @@ static void adjust_for_img_dbl(KpList *l)
 {
     int i;
     for (i = 0; i < l->n; i++) {
-        l->items[i].x /= 2.0f;
-        l->items[i].y /= 2.0f;
-        l->items[i].scl /= 2.0f;
+        l->items[i].x /= (float)FOCAL_DBL_SCALE;
+        l->items[i].y /= (float)FOCAL_DBL_SCALE;
+        l->items[i].scl /= (float)FOCAL_DBL_SCALE;
     }
 }
 
@@ -557,7 +572,27 @@ typedef struct {
 int focal_extract_features(const unsigned char *img, int rows, int cols,
                             int octaves, FocalFeature **out_features)
 {
-    FImage *base = create_init_img(img, rows, cols, FOCAL_IMG_DBL, FOCAL_SIGMA);
+    /* CONFIRMED via real .so ground truth: pad the native capture into the
+     * algorithm's fixed 96x96 working canvas (centered, zero-padded --
+     * the aspect-ratio-preserving choice; a stretch would distort ridge
+     * geometry, see PROTOCOL.md) before running detection at all. */
+    int canvasDim = FOCAL_WORKING_CANVAS;
+    unsigned char *padded = NULL;
+    const unsigned char *detectInput = img;
+    int detectRows = rows, detectCols = cols;
+    if (rows != canvasDim || cols != canvasDim) {
+        padded = calloc((size_t)canvasDim * canvasDim, 1);
+        int padRows = (canvasDim - rows) / 2, padCols = (canvasDim - cols) / 2;
+        int r;
+        for (r = 0; r < rows && r + padRows < canvasDim; r++)
+            memcpy(padded + (r + padRows) * canvasDim + padCols, img + r * cols,
+                   (size_t)(cols < canvasDim - padCols ? cols : canvasDim - padCols));
+        detectInput = padded;
+        detectRows = detectCols = canvasDim;
+    }
+
+    FImage *base = create_init_img(detectInput, detectRows, detectCols, FOCAL_IMG_DBL, FOCAL_SIGMA);
+    free(padded);
     FImage ***gpyr = build_gauss_pyr(base, octaves, FOCAL_INTVLS, FOCAL_SIGMA);
     FImage ***dpyr = build_dog_pyr(gpyr, octaves, FOCAL_INTVLS);
 
