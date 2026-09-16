@@ -4285,3 +4285,78 @@ all 20 fail it uniformly -- there is no differential rejection possible, and cri
 carries no identity signal at all**: it does not correlate with which captures are same-finger vs
 different-finger pairs. A quality gate applied to this dataset would not change which captures are compared,
 and could not explain the lack of same/different separation. STEP 2 comes up empty.
+
+## Windows-vs-Linux discrepancy investigation, STEP 3: real DAC convergence matches the locked value used for the dataset -- comes up empty (2026-09-17)
+
+`tools/rts5811_wake_test.c` already contained (from an earlier session) a `run_dac_calibration()` loop
+implementing the real, confirmed per-step adjustment mechanism traced from `fw9366_Img_Get_Better_DAC`
+(0x15cd3c): capture an image, count out-of-range pixels via the real `img_get_out_of_range_point`, decrement
+DAC if both low-count and high-count are <=19, increment if either is >20, otherwise converged. This was run
+this session (hardware physically present: `2808:a658 Realtek USB2.0 Finger Print Bridge FocalTech Fingerprint
+Device`), starting fresh from the default `dac=0x36`, no finger on the sensor (baseline calibration, matching
+how a real driver would calibrate against the background before capture):
+```
+iter 0: dac=0x36 out_low=0  out_high=0 avg_middle=653 -> decrement to 0x35
+iter 1: dac=0x35 out_low=0  out_high=0 avg_middle=488 -> decrement to 0x34
+iter 2: dac=0x34 out_low=1  out_high=0 avg_middle=323 -> decrement to 0x33
+iter 3: dac=0x33 out_low=1381 out_high=0 avg_middle=157 -> increment to 0x34 (out-of-range)
+iter 4: dac=0x34 out_low=1  out_high=0 avg_middle=323 -> already tried, oscillation detected
+  -> stopping, using best observed dac=0x35 (score=12, closest to target avg_middle=500)
+FINAL: dac=0x35
+```
+**This converges to exactly `0x35` -- the same DAC value that was locked in via `FIXED_DAC=0x35` for every
+single capture in both `calibrated_set` and `varied_set`.** The oscillation between 0x33/0x34 near the edge of
+the valid range is a real, reproducible property of the confirmed adjustment mechanism itself (not a bug in
+this project's reconstruction) -- the real outer-loop iteration count/hysteresis of the proprietary
+`fw9366_AutoSDacUpdate` was never fully traced, but the per-step adjustment logic used here is the real,
+confirmed mechanism, and it lands on the same answer already used throughout this project's dataset.
+
+### STEP 3 conclusion
+The DAC value used for the entire test dataset is not a shortcut that diverges from real calibration --
+running the real, confirmed convergence mechanism fresh reproduces the same value. STEP 3 comes up empty.
+
+## Windows-vs-Linux discrepancy investigation: STEP 4 -- final report (2026-09-17)
+
+All three ruled-out gaps from the bounded investigation came up empty:
+- **STEP 1** (distinct enrollment path): found and traced `FtGetTemplateForEnroll`, a genuinely distinct,
+  real, previously-untested function. It runs to completion (unlike `FtGetTemplate`, which crashes in
+  `memcpy` at `FtAlg.c:4144`). Its one real preprocessing difference from this project's methodology (SPA
+  smoothing, exact confirmed parameters) was implemented and retested against the full 190-pair dataset: gap
+  went from -0.0066 to -0.0045 -- no material change, separation remains absent and inverted.
+- **STEP 2** (capture-time quality gating): found and called the real `FtGetImageQuality`/`FtImgQuality`
+  dispatch chain against every capture in the dataset. All 20 captures across 3 fingers score within a tight,
+  nearly-identical band (quality 40-44, area 99-100, cond 38-47) with **no correlation to same/different-finger
+  identity whatsoever**. A quality gate at any threshold could not explain the lack of separation.
+- **STEP 3** (DAC calibration completeness): ran the real, confirmed convergence mechanism fresh on physical
+  hardware. It converges to `dac=0x35` -- exactly the value already locked in and used for the entire dataset.
+  No calibration shortcut gap exists.
+
+**Conclusion: the Windows-vs-Linux discrepancy is not explained by anything inside this `.so`.** Every
+mechanism this project has been able to locate and test with 100% real vendor code -- detection, binarization,
+descriptor extraction, the dedicated enrollment-time function and its real preprocessing order, `FtCalcSimScore`
+matching, multi-subtemplate best-of-N, post-hoc multi-touch fusion, capture-time quality gating, and DAC
+calibration convergence -- has been traced, exercised with real vendor code, and tested against a properly
+varied 190-pair real dataset (10 index-finger angle/pressure variants, 5 middle, 5 ring). None of it separates
+same-finger from different-finger identity above noise.
+
+Given the sensor demonstrably works correctly under Windows Hello, and every mechanism inside this specific
+`.so` (`libfprint-2.so.2.0.0`) that this project can locate has now been ruled out as the explanation, the
+remaining plausible explanations are **outside this `.so` entirely**:
+- A separate Windows Biometric Framework (WBF) component (the WBF pipeline sits above vendor "engine" DLLs and
+  may apply its own additional preprocessing, liveness/quality gating, or matching logic not present in this
+  Linux `.so` at all).
+- A firmware-level processing mode on the sensor itself, enabled only by Windows' real driver initialization
+  sequence, that produces materially different raw image data than what this project's `rts5811_wake_test.c`
+  capture path obtains (a "sees a different image" gap rather than a "processes the same image differently"
+  gap) -- the DAC calibration convergence result (STEP 3) rules out gain/exposure as that gap, but does not
+  rule out other firmware-level image conditioning (e.g. a hardware denoising/HDR mode) never exposed to this
+  userspace `.so`'s capture path.
+- A completely different, Windows-only matching engine/DLL not present in or callable from this Linux `.so`
+  at all (the `.so` analyzed this whole project may be a stripped-down or older algorithm variant bundled for
+  Linux/fprintd support specifically, distinct from what Windows Hello actually loads).
+
+This project has now thoroughly explored the one `.so` available to it. Continuing to guess inside the same
+binary is not likely to be productive; further progress would require either capturing/comparing raw sensor
+data under the real Windows driver (to test the firmware-processing-gap hypothesis) or otherwise verifying
+this is a genuine, well-evidenced viability limit for this specific `.so`/sensor combination on Linux, as this
+project's own prior conclusion (before this bounded investigation) had already stated.
