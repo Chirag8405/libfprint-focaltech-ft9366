@@ -2469,3 +2469,39 @@ Implemented in `tools/focal_match.c`, each function tagged CONFIRMED or BEST-EFF
 3. Implement Step 4 (RANSAC + affine fit + the confirmed `FtCalcSimScore` agreement-rate formula).
 4. Only then re-run the same 45-pairwise same/different-finger comparison this session already has real data
    for, and report the raw scores plainly.
+
+## Reimplementation: Step 2-3 (focal_sift.c) compiles, first real-data run (2026-09-16)
+
+Status: COMPILES, runs on real captures without crashing. Reporting the raw diagnostic result plainly --
+this is NOT the real matcher yet (no RANSAC/affine alignment, no `FtCalcSimScore` formula), so an inconclusive
+result here does not indicate failure of the overall approach.
+
+Fixed one real bug caught before running: descriptor sampling was initially re-deriving pyramid-local
+coordinates from the global (octave- and img_dbl-scaled) x/y, which only accounted for img_dbl and silently
+ignored per-octave downsampling -- would have sampled the wrong pixels for any keypoint above octave 0. Fixed
+by carrying the already-available local (per-pyramid-level) coordinates through unchanged, per this session's
+"validate before trusting compiles-and-runs" discipline.
+
+### First real-data feature counts (64x80 native captures, octaves=3, image doubled per confirmed imgDbl=1)
+```
+same1.raw: 47 features   same2.raw: 55 features   diff1.raw: 39 features
+```
+**39-55 keypoints per capture -- dramatically more than stock MINDTCT's 1-5 minutiae on the same sensor
+(STEP 3 minutiae evaluation, earlier this session)**. This is concrete, positive evidence for the hypothesis
+that FocalTech's approach was specifically chosen/tuned to work at this resolution where classic minutiae
+detection cannot.
+
+### Crude nearest-neighbor Hamming diagnostic (NOT the real matcher -- reported for transparency only)
+```
+same1 vs same2:  avg best-Hamming = 44.4 / 256 bits
+same1 vs diff1:  avg best-Hamming = 42.5 / 256 bits
+same2 vs diff1:  avg best-Hamming = 51.0 / 256 bits
+```
+Does not yet separate same-finger from different-finger (expected -- this diagnostic has no geometric
+verification, so many "nearest Hamming neighbor" pairs are almost certainly false correspondences from
+locally-similar-looking but non-corresponding ridge texture, not true matches). All three values sit well
+below the ~128/256 expected for random/uncorrelated descriptors, which is a positive sign the descriptor is
+capturing real structure, just not yet usable as a score without the alignment step. Reporting this plainly
+rather than as a pass/fail on the real matcher, since it isn't the real matcher.
+
+### Next: implement Step 4 (RANSAC + affine fit + FtCalcSimScore) to get a real, meaningful score
