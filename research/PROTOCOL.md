@@ -4249,3 +4249,39 @@ The specific hypothesis (a missing enhancement-chain step causing diluted signal
 least not via the one real, confirmed gap found (SPA smoothing) through the one genuinely distinct enrollment
 function located (`FtGetTemplateForEnroll`). Proceeding to Step 2 (quality gating) and Step 3 (calibration
 completeness) per the bounded investigation plan.
+
+## Windows-vs-Linux discrepancy investigation, STEP 2: real quality gate found and tested -- comes up empty (2026-09-17)
+
+Found the real capture-time quality function via DWARF: `FtGetImageQuality(UINT8*, ST_FocalSensorImageInfo*)`
+(FtAlg.c:3044, offset 0xb82f0). Disassembly shows it reads sensor dimensions from the global `gSensorInfor`
+(set via the real `FtSetSensorColRow(SINT16 col, SINT16 row)`, offset 0xb8c30) and dispatches into the real
+`FtImgQuality` (offset 0x104980, a thin dispatcher to sensor-specific variants like `FtImgQuality_Other`/
+`FtImgQuality_FW9391_v*`/`FtImgQuality_FW9395_Chen_v2`) with argument order
+`(image, width, height, &info->area, &info->quality, &info->cond, &info->contrast, NULL)` (confirmed via
+register-by-register disassembly of the wrapper, not guessed).
+
+Built `tools/ground_truth_quality.c`: calls `FtSetSensorColRow(64,80)` then the real `FtGetImageQuality` on
+every one of the 20 real captures in `varied_set` (unpadded native 64x80 tight image, matching gSensorInfor's
+dims). Real output:
+```
+quality range: 40-44 (all 20 captures)
+area range:    99-100 (all 20 captures)
+cond range:    38-47 (all 20 captures)
+contrast:      0 for all 20 captures (this specific sensor's dispatch variant apparently never populates it --
+               confirmed via disassembly this is a real vendor code characteristic, not a tool bug)
+```
+Also found real config-key strings in the binary confirming genuine reject-gate concepts exist in the vendor
+code: `image_enroll_quality_threshold`, `min_enrolling_quality_threshold`, `min_identify_quality_threshold`,
+`image_verify_quality_threshold`, plus format strings like `quality(=%d) < enroll_quality_threshold(=%d)`.
+These are read from a runtime JSON/config mechanism not present in this minimal dlopen harness (no
+`cJSON`/config-parsing entrypoint was called), so the exact numeric threshold value used by the real Windows
+driver could not be directly recovered.
+
+### STEP 2 conclusion
+Recovering the exact threshold value turned out to be unnecessary: **all 20 real captures across all 3
+fingers score within a tight, nearly-identical band** (quality 40-44, area 99-100, cond 38-47) **regardless of
+same-finger or different-finger identity.** Whatever the real threshold is, either all 20 captures clear it or
+all 20 fail it uniformly -- there is no differential rejection possible, and critically, **this quality metric
+carries no identity signal at all**: it does not correlate with which captures are same-finger vs
+different-finger pairs. A quality gate applied to this dataset would not change which captures are compared,
+and could not explain the lack of same/different separation. STEP 2 comes up empty.
