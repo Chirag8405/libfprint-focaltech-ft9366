@@ -4507,3 +4507,76 @@ Next: test directly -- background-subtract each verify-segment touch frame using
 run both the raw and background-subtracted versions through the real `.so` pipeline
 (`FtSegmentByLocalVariance`/`FtGetMfbFeatures`/`FtCalcSimScore`), and compare feature quality and same-finger
 matching scores.
+
+## Background-subtraction hypothesis: tested directly, REFUTED -- but a much bigger finding fell out of the same test (2026-09-17)
+
+### Background subtraction test result: negative
+Built background-subtracted versions of the 7 verify-phase touch frames (touch - paired near-blank frame,
+offset to keep values non-negative) and ran both the raw and background-subtracted versions through the real
+`.so` pipeline (`ground_truth_calcsimscore_batch_spa`, same-finger pairs only, all real Windows-driver-captured
+data of one physical finger):
+```
+raw touch frames (no subtraction):        n=21  avg=0.8663  min=0.5227  max=0.9822
+background-subtracted (touch - blank):    n=21  avg=0.5503  min=0.4878  max=0.7930
+```
+Subtraction made matching uniformly WORSE, not better -- every subtracted-image seedSetN collapsed to 2-5 (vs.
+a healthy range for the raw versions), meaning the real feature detector found far fewer usable, mutually-
+consistent keypoints once the paired "blank" frame was subtracted out. **The background-subtraction hypothesis
+is REFUTED**: whatever the real Windows driver's alternating touch/near-blank capture pattern during verify is
+for, it is almost certainly NOT image-enhancement-via-background-subtraction before matching (subtracting these
+blank frames actively destroys real ridge signal, since the "blank" frame is not a clean, noise-only sensor
+background -- it has its own faint structure/noise that doesn't cancel cleanly). The alternating pattern itself
+remains real and worth understanding, but a more likely explanation is a liveness-check or
+finger-presence/lift-off polling cycle unrelated to image quality enhancement, not a preprocessing step this
+project's matching pipeline was missing.
+
+### MUCH bigger finding, found via the same test: same-finger score is strongly driven by this project's OWN alignment estimator, not by true identity
+While running the real `.so` pipeline against 18 real, same-finger, Windows-driver-captured enrollment frames
+(153 same-finger pairs, zero different-finger contamination possible -- these are all genuinely one real
+finger, captured by the real vendor driver), the resulting same-finger score distribution was itself
+surprisingly wide and low-tailed:
+```
+SAME-finger (real Windows-driver-captured, single real physical finger): n=153  avg=0.9063  min=0.4413  max=0.9941
+```
+A min of 0.4413 for a GENUINE same-finger pair is already deep into the range this whole project has called
+"different-finger" throughout its testing. Breaking the same 153 pairs down by `seedSetN` (the number of
+mutually-consistent candidate keypoints THIS PROJECT'S OWN alignment estimator -- the Hamming+ratio candidate
+test, distance-consistency graph, greedy clique growth, closed-form rigid fit -- manages to find for a given
+pair) shows an almost perfectly monotonic relationship:
+```
+seedSetN=2        n=2   avg=0.5492  min=0.4951  max=0.6033
+seedSetN=3        n=9   avg=0.5562  min=0.4413  max=0.8094
+seedSetN=4        n=10  avg=0.7743  min=0.5318  max=0.9146
+seedSetN=5        n=9   avg=0.7841  min=0.5460  max=0.9697
+seedSetN=6        n=8   avg=0.9179  min=0.7947  max=0.9899
+seedSetN=7        n=21  avg=0.9347  min=0.7459  max=0.9864
+seedSetN=8        n=21  avg=0.9428  min=0.8009  max=0.9873
+seedSetN=9        n=18  avg=0.9728  min=0.9061  max=0.9895
+seedSetN=10-19     n=46  avg=0.9691  min=0.8023  max=0.9934
+seedSetN=20-39     n=3   avg=0.9878  min=0.9836  max=0.9918
+seedSetN=40+       n=6   avg=0.9906  min=0.9858  max=0.9941
+```
+**Score climbs cleanly and almost monotonically with seedSetN, from ~0.55 average at seedSetN=2-3 up to ~0.99
+average at seedSetN=40+, for pairs of the SAME real finger.** This strongly suggests that a large share of the
+"non-separation" result this entire project has observed across all prior testing (the 190-pair varied_set
+included) is driven by variance in how well THIS PROJECT'S OWN hand-built alignment/candidate-correspondence
+step happens to perform on a given pair -- not by a genuine lack of same/different-finger signal in the real
+`FtCalcSimScore` function itself. A same-finger pair scores low when this project's own alignment estimator
+finds only 2-4 consistent candidate matches (likely due to larger relative rotation/translation or partial
+overlap between the two touches that this project's simplified greedy-clique-growth alignment handles poorly);
+the exact same physical finger pair can score >0.98 when the estimator happens to find 40+ consistent matches.
+
+### Implication
+This project has never fully reverse-engineered or reimplemented the REAL vendor's own alignment/correspondence
+step used internally by `FtVerifyTwoTemplate`/`FtVerifyByTemplate` -- it has always substituted its own
+approximate reimplementation (candidate matching via Hamming distance + ratio test, then a distance-consistency
+graph with greedy clique growth) purely to generate the H-matrix inputs `FtCalcSimScore` needs. If the real
+vendor alignment step is meaningfully more robust than this reimplementation (e.g. genuine RANSAC with many
+iterations and inlier refinement, rather than a single greedy seed-and-grow pass), that alone could explain a
+large fraction of the persistent non-separation result across this entire project's testing -- independent of
+every other hypothesis tested so far (enrollment path, quality gating, DAC calibration, orientation,
+acquisition parameters). This is now the single most promising, concrete lead for explaining the whole
+Windows-vs-Linux discrepancy, and the natural next step: locate and directly call the real vendor alignment
+function (if one is separately exported/callable), or substantially harden this project's own alignment
+estimator (proper multi-seed RANSAC with inlier-count maximization rather than single greedy clique growth) and
+re-test.
