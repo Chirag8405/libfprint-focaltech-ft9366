@@ -4411,3 +4411,40 @@ the "true" sensor mounting orientation were flipped relative to assumption, it w
 detection quality -- but the coordinate-sanity check independently confirms the assumed convention is already
 correct). This specific check is closed. Per the investigation plan, moving to the acquisition-parameters
 hypothesis next (raw exposure/gain/frame-averaging registers from the original wake/init byte trace).
+
+## Windows-vs-Linux discrepancy investigation -- acquisition-parameters hypothesis (2026-09-17)
+
+Checked `tools/rts5811_wake_test.c`'s own confidence markers: `img_mode_init_0` (the full chip-level
+mode/scan-setup register sequence -- DAC register 0x1801, mode register 0x1800, 0x1804/0x1807/0x1887 fixed
+constants, `set_scan_rate_2m()`'s three read-modify-writes at 0x1806/0x180a/0x180b, the 0x1805/0x1811
+read-modify-writes, interrupt-mask/gap-timer setup) is explicitly annotated "fully traced, 100%, and tested
+clean against real hardware" -- not a guess or partial reconstruction. The only item anywhere in this file
+flagged as not fully traced is the outer convergence-loop structure of `fw9366_AutoSDacUpdate` (STEP 3, already
+tested: converges to the same DAC value already used).
+
+Searched the real `.so`'s full DWARF symbol table for any higher-level acquisition-control mechanism beyond
+this already-tested DAC value: `Exposure`, `Gain`, `Average`/`MultiFrame`/`FrameAvg`, `Acquire`. **None exist.**
+The only gain/brightness-control primitive anywhere in the codebase is `fw9366_Img_Get_Better_DAC` (the DAC
+adjustment mechanism already traced and tested in STEP 3). There is no separate exposure-time register, no
+analog/digital gain register, and no multi-frame-averaging function in this sensor's real code at all.
+
+### Conclusion: acquisition-parameters hypothesis RULED OUT
+There is no acquisition-time knob in this `.so`/chip beyond the DAC value already tested to convergence in
+STEP 3. This hypothesis is closed with the same evidence already gathered -- no new gap found.
+
+## Windows-vs-Linux discrepancy investigation -- updated final status (2026-09-17)
+
+Two additional hypotheses beyond the original bounded Steps 1-3 have now also been tested and ruled out with
+real evidence: **orientation/mirroring** (keypoint detection is orientation-equivariant; real keypoints land on
+genuine high-variance ridge content in this project's own coordinate convention, no flip/transpose needed) and
+**acquisition parameters** (no exposure/gain/frame-averaging mechanism exists beyond the already-tested,
+already-converging DAC value). Combined with the original Steps 1-3 (distinct enrollment path + SPA smoothing,
+capture-time quality gating, DAC calibration completeness), this project has now tested every mechanism it can
+locate inside `libfprint-2.so.2.0.0` with 100% real vendor code, using a properly varied 190-pair real dataset,
+and found no explanation for the Windows-vs-Linux discrepancy anywhere inside this binary.
+
+Further progress on this specific question (why does the sensor work on Windows but not here) requires
+evidence this project cannot generate by continuing to introspect the same `.so`: either a USB capture of the
+real Windows driver's traffic to the sensor (to check for firmware-level image conditioning or an entirely
+different acquisition sequence never exposed to this Linux `.so`), or acceptance that this is a genuine,
+now extremely well-evidenced viability limit for this specific `.so` on Linux.
