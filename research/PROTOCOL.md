@@ -4718,3 +4718,66 @@ understanding its true structural role) is not a drop-in improvement.
 Reverted to the prior working formula for the shipped/tested tooling; `ground_truth_calcsimscore_batch_realcand.c`
 and `ground_truth_verify_two_template.c` are kept as historical diagnostic artifacts documenting this
 investigation, not as improvements to adopt going forward.
+
+## Alignment/correspondence root-cause investigation: PAUSED -- static analysis insufficient, pivoting to live Windows debugging (2026-09-17)
+
+Status: UNRESOLVED. Not abandoned, not disproven -- static disassembly analysis of this isolated `.so` function
+has reached its useful limit for this specific question, and this investigation is pivoting to a fundamentally
+better vantage point that is now available: a live debugger attached to the REAL Windows driver/service while
+it performs a real verify against the real sensor (enabled by the `win11-fpsensor` libvirt VM with USB
+passthrough set up earlier this session -- see the "Real Windows driver USB capture" entries above).
+
+### What is CONFIRMED and stands regardless of how this resolves
+These facts do not depend on correctly interpreting the loop's purpose, and should NOT be re-derived or
+second-guessed without new contradicting evidence:
+- A real, separate, inline candidate-generation code region exists inside `FtVerifyTwoTemplate` (`FtAlg.c`,
+  file offset range ~0xc3d61-0xc3f6e), distinct from the already-independently-confirmed-faithful
+  `FtRansacAngle_32f` distance-consistency-graph alignment stage.
+- It computes full 256-bit descriptor Hamming distances via a genuine byte-lookup-table popcount
+  (table `invHMTableAlg`), confirming this project's own `__builtin_popcount`-based Hamming computation is
+  mathematically equivalent to the real implementation technique (this part is solid, not in question).
+- A hardcoded 9-entry margin table `[64, 64, 64, 12, 8, 6, 3, 2, 1]` is used in an accept/reject decision late
+  in this loop, confirmed via raw disassembly (literal immediate byte stores at offsets 0x1e50-0x1e58) -- this
+  exact table is a real fact independent of interpretation.
+
+### What is SUPERSEDED-PENDING-LIVE-VERIFICATION -- not deleted, not confirmed wrong, just uncertain
+The INTERPRETATION of what this loop's tracked state means is now flagged as uncertain, not settled either way:
+- The "STEP 3: naive port FAILED" entry's conclusion (that the loop is "not nearest-neighbor selection... tracks
+  something else entirely") was based on a single feature's (i=3) 11-candidate scan, manually simulated against
+  a hypothesized update rule reverse-engineered from ~40 lines of hand-read disassembly. This interpretation
+  could itself be wrong (e.g. a register-role mixup like the one already caught and corrected once earlier in
+  this same investigation) -- it is a working hypothesis backed by one consistent simulation, not a
+  live-confirmed fact.
+- A follow-up full-state-dump trace (registers + relevant stack slots at every iteration, requested to avoid
+  repeating the "assumed the wrong variable is the answer" mistake) was in progress against a second feature for
+  cross-validation when this investigation was paused -- it had not yet produced a second-feature confirmation
+  or contradiction before stopping. That partial trace output was NOT saved as a project artifact (it was
+  interactive gdb output only, not a committed tool/finding) and should be treated as inconclusive, not as
+  evidence either way.
+
+### Why pivoting now, and to what
+Continuing to hand-disassemble this isolated function's control flow has already produced one confidently-wrong
+intermediate conclusion this session (the original "best/second-best nearest-neighbor" reading, corrected once
+already via live gdb register inspection, then found to be incomplete/possibly still-wrong at a deeper level).
+A live debugger attached to the REAL Windows driver process while it performs a REAL verify against the REAL
+sensor -- now possible via the `win11-fpsensor` VM's USB passthrough setup -- can observe this loop's actual
+runtime behavior directly in its real, intended calling context (real `gSensorInfor` config, real FAR/security
+mode, real calling conventions from the real driver stack), rather than this project's minimal, possibly
+incompletely-initialized `dlopen` harness (`ground_truth_verify_two_template.c`, which itself crashes later in
+`FtVerifyTwoTemplate` at `FtAlg.c:7268` -- a sign this harness's template setup is not fully faithful to what a
+real caller provides). This is a strictly better evidence source for resolving the remaining ambiguity.
+
+### State of the codebase at this pause point
+No changes made to `focal_verify.c`, `focal_sift.c`, `focal_match.c`, or any other shipped reimplementation
+file during this specific line of investigation -- only new diagnostic-only tools were added
+(`tools/ground_truth_verify_two_template.c`, `tools/ground_truth_calcsimscore_batch_realcand.c`), both already
+committed, both explicitly NOT adopted as fixes (see the prior entry's conclusion). The codebase remains in the
+same state as the last commit; nothing further to commit from this specific paused sub-investigation beyond
+this log entry.
+
+### Next step (when resumed)
+Attach a live debugger (or use whatever introspection the Windows driver/service architecture allows -- e.g.
+WinDbg attached to the fingerprint service process, or a kernel-level USB trace correlated with driver-side
+breakpoints) to the REAL driver during a REAL verify in the `win11-fpsensor` VM, and observe the equivalent
+candidate-generation logic's real runtime state directly, rather than continuing to reason about it from a
+`.so`-only, potentially-incompletely-initialized vantage point.
