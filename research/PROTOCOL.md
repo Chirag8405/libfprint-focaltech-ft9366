@@ -4781,3 +4781,114 @@ WinDbg attached to the fingerprint service process, or a kernel-level USB trace 
 breakpoints) to the REAL driver during a REAL verify in the `win11-fpsensor` VM, and observe the equivalent
 candidate-generation logic's real runtime state directly, rather than continuing to reason about it from a
 `.so`-only, potentially-incompletely-initialized vantage point.
+
+## MAJOR FINDING: live trace of the real Windows driver reveals adaptive template updating and vastly larger real templates (2026-09-17)
+
+Status: CONFIRMED via a live, fully-successful debugger trace of the REAL `ftWbioEngineAdapter.dll` (FocalTech's
+"WBF Engine Adapter", v1.10.25.3521) running inside the REAL `WbioSrvc` service (`svchost.exe -k WbioSvcGroup -s
+WbioSrvc`), during a REAL identify operation against the REAL sensor, captured via x64dbg attached to the
+service process while a WinBio API call (`WinBioOpenSession`+`WinBioIdentify`, called directly via a small
+PowerShell/P-Invoke script to get a controlled, non-racy trigger point) executed. The engine DLL is richly
+instrumented with `OutputDebugString` calls (`[Engine] V/I ...`) that x64dbg captures automatically -- this
+gave a complete, real, plain-text call trace of the actual production code path, far more informative than
+continued static disassembly of the isolated `.so`.
+
+### Setup: live debugging via the win11-fpsensor VM
+- Process: `svchost.exe` hosting `WbioSrvc` (no PPL/protection -- attach succeeded normally, confirmed via
+  Task Manager's "Protection Type" column showing "None" before attaching).
+- Target module: `C:\Windows\System32\WinBioPlugIns\ftWbioEngineAdapter.dll` (loaded lazily per-operation, not
+  resident at rest -- unloads again once the service goes idle).
+- Trigger mechanism: rather than racing the lock screen (which risks freezing the secure desktop and locking
+  the user out entirely -- happened once this session, recovered via a hard VM power-cycle from the host) or
+  the Settings app (which only offers "Add another finger" in this build, no plain verify test button), used
+  the real `WinBioOpenSession`+`WinBioIdentify` WBF client API directly via a PowerShell P-Invoke script.
+  `WinBioIdentify` blocks synchronously waiting for a sensor touch with no time pressure, giving unlimited time
+  to attach the debugger between opening the session and actually touching the sensor -- a clean, race-free,
+  secure-desktop-free trigger.
+
+### Real quality gate output (previously unknown third metric)
+```
+EngineAdapterAcceptSampleData: VerticalLineLength 80 HorizontalLineLength 64 VerticalImageResolution 508
+  HorizontalImageResolution 508 impressionType 2
+EngineAdapterAcceptSampleData: WINBIO_PURPOSE_IDENTIFY
+EngineAdapterAcceptSampleData: quality:56, area:83, humility:45
+```
+Confirms the known 80x64 raw frame dimensions and 508 DPI. Reveals a THIRD quality metric, "humility" (56/83
+were presumably quality/area; humility=45 has no counterpart in the previously-mapped `FtGetImageQuality`
+output fields `{quality, area, cond, contrast}` from earlier `.so`-only testing -- likely a WBF-adapter-level
+metric computed on top of or alongside the core algorithm's own quality check, not yet traced further.
+
+### Real identify loop: 5 enrolled records, tried sequentially, real sizes and outcomes
+```
+Found 5 records in the result set
+SubFactor 246  TemplateBlobSize 235678  -> alg->verify -> return -1 (failed)
+SubFactor 247  TemplateBlobSize 237174  -> alg->verify -> return -1 (failed)
+SubFactor 248  TemplateBlobSize 236690  -> alg->verify -> return -1 (failed)
+SubFactor 249  TemplateBlobSize 228462  -> alg->verify -> return -1 (failed)
+SubFactor 245  TemplateBlobSize 310698  -> alg->verify -> return 0 (success) -> MATCH
+identify total time: 47 ms
+```
+**Real stored template blobs are 228KB-310KB each** -- three to four orders of magnitude larger than this
+project's `ST_FocalTemplate` reimplementation (520-byte header + a few KB of feature data for ~150 features).
+This strongly suggests the real, shipped "template" is a much richer composite/multi-sample structure than the
+single-capture feature-point template this entire project has been reverse-engineering and testing against.
+(Encrypted at rest -- `common_identify: decrypt templates` precedes each verify call -- so the real on-disk
+format cannot be inspected directly without also reversing the encryption, not attempted.)
+
+### CRITICAL: the real system performs adaptive template updating after every successful match
+```
+common_identify: MATCH
+dynamic_update_thread: start learn
+fingerprint_dynamic_update: 'fingerprint_dynamic_update' ->
+fingerprint_dynamic_update: update encrypt
+crypt_template
+fingerprint_dynamic_update: DeleteRecord success
+fingerprint_dynamic_update: AddRecord success
+fingerprint_dynamic_update: 'fingerprint_dynamic_update' <- (0x00000000)
+```
+After every successful identify, the real driver DELETES the matched template record and WRITES A NEW, UPDATED
+ONE incorporating the just-captured sample. This is a continuously self-improving/adaptive template system,
+not a static enroll-once-match-forever system. Every successful real-world login on Windows makes that specific
+stored record better calibrated to recent capture conditions.
+
+### Why this matters for the whole project
+This project's entire testing methodology (this session's Windows-capture same-finger tests, the original
+190-pair varied_set test, and everything in between) has always compared RAW, NEVER-ADAPTED individual captures
+against each other, using a single lightweight feature-point template format. The real system's templates are
+(a) vastly larger/richer composite structures and (b) continuously refined by every successful real use. A
+freshly-enrolled, never-adapted template compared against a handful of raw captures -- exactly this project's
+testing setup throughout -- may be fundamentally unrepresentative of how the real system actually achieves
+reliable matching in practice. This is a plausible, evidence-backed, independent explanation for a large share
+of the persistent non-separation result, on top of (not replacing) the still-unresolved candidate-generation
+question from the immediately preceding investigation.
+
+### Operational notes for future live-debugging sessions
+- `WbioSrvc`'s hosting `svchost.exe` is NOT PPL-protected -- direct x64dbg attach works with no workaround
+  needed. Confirmed via Task Manager's Protection Type column showing "None" prior to attach, and via a
+  successful attach + full trace capture.
+- `WbioSrvc` is a true on-demand service: it fully exits (not just idles) shortly after handling a request, and
+  `ftWbioEngineAdapter.dll` is unloaded with it -- there is no stable long-lived process to attach to ahead of
+  time. `Start-Service WbioSrvc` can pre-warm it, but it still exits again once idle.
+- x64dbg's "Run"/F9 with no active debuggee re-launches the last-used target path fresh (`svchost.exe` with no
+  service arguments) rather than doing nothing -- caused several confusing blank-process loops this session.
+  Always use File -> Attach to a freshly-checked real PID; never press F9 when nothing is attached.
+- Do NOT trigger the verify via the lock screen while a breakpoint might pause execution -- the lock screen
+  runs on Windows' secure desktop, which cannot be alt-tabbed away from to reach the debugger if the service
+  freezes mid-call. This happened once this session and required a hard VM power-cycle (`virsh destroy` +
+  `virsh start`) from the host to recover. The Settings app's fingerprint page and the WinBioIdentify
+  PowerShell script are both safe (normal desktop, no secure-desktop risk).
+- The WinBioOpenSession+WinBioIdentify PowerShell P-Invoke script (see this entry) is the recommended trigger
+  for all future live traces: it blocks indefinitely and race-free, entirely on the normal desktop.
+
+### Next steps
+1. Determine whether the adaptive-update mechanism alone (independent of the still-unresolved
+   candidate-generation question) can explain the non-separation result -- e.g. by checking whether repeated
+   real Windows verifies of the SAME finger show scores that improve over successive attempts (consistent with
+   templates adapting/improving), which this project's static, non-adaptive testing would never reproduce.
+2. Continue watching for the actual `alg->verify` internals in future traces (this trace showed it as a single
+   opaque logged step, "call alg->verify" / "KPI alg->verify used N ms" -- the correspondence-generation loop
+   from the previous investigation lives inside this opaque call and was not separately visible in this
+   specific trace's OutputDebugString output).
+3. Consider whether the ~230-310KB template blob size can be explained by a specific number of merged
+   sub-samples (e.g. divide by a plausible per-sample size to estimate a merge count) as a next concrete,
+   checkable detail.
