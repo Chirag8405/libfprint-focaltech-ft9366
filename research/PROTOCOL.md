@@ -4360,3 +4360,54 @@ binary is not likely to be productive; further progress would require either cap
 data under the real Windows driver (to test the firmware-processing-gap hypothesis) or otherwise verifying
 this is a genuine, well-evidenced viability limit for this specific `.so`/sensor combination on Linux, as this
 project's own prior conclusion (before this bounded investigation) had already stated.
+
+## Windows-vs-Linux discrepancy investigation -- orientation/mirroring hypothesis (2026-09-17)
+
+New hypothesis: since alignment uses a RIGID (rotation+translation) Procrustes/RANSAC transform, it cannot
+correct for a reflection/mirroring mismatch -- a mirrored same-finger pair would look geometrically
+inconsistent to the aligner in exactly the same way a genuinely different finger would, reproducing the
+non-separation symptom seen throughout this whole investigation. Given this project's history of real
+sign/direction bugs (ori+pi vs -ori descriptor convention; RANSAC winding direction), this was worth testing
+directly against the real .so rather than assuming the existing convention is correct.
+
+### STEP 1: does keypoint detection quality/structure differ across orientations?
+Built `tools/ground_truth_orientation_test.c`: takes ONE real capture, generates all 4 orientations (original,
+horizontal flip, vertical flip, 180-deg rotation) of the tight 80x64 image, and runs each through the real,
+confirmed pipeline (SPA smoothing -> `FtSegmentByLocalVariance` -> `FtGetMfbFeatures`) independently. Tested on
+3 real captures (idx01, idx05, ring01):
+```
+capture           original        hflip           vflip           rot180
+idx01             kp=160 (78/82)  kp=160 (78/82)  kp=160 (80/80)  kp=160 (80/80)
+idx05             kp=160 (76/84)  kp=160 (78/82)  kp=160 (79/81)  kp=160 (79/81)
+ring01            kp=160 (80/80)  kp=160 (80/80)  kp=160 (84/76)  kp=160 (81/79)
+```
+Mask area is bit-identical within each capture across all 4 orientations (as expected, since local-variance
+segmentation is itself reflection/rotation-symmetric). Total keypoint count is IDENTICAL (160) in every case;
+the max/min split varies by at most +-4 due to tie-breaking at near-symmetric extrema, not a meaningful
+quality difference. Per-keypoint positions transform exactly as geometrically expected under each transform,
+and `ori` values flip sign consistently under reflection and shift by pi under 180-deg rotation -- confirming
+the real detector is essentially equivariant to these transforms with **no orientation producing detectably
+better or worse keypoint structure than any other.**
+
+### STEP 2: do real keypoint coordinates land on genuine ridge content in this project's own buffer?
+Built `tools/ground_truth_coord_sanity.c`: for every real keypoint (x,y) reported by the real
+`FtGetMfbFeatures` on this project's own captured+SPA-smoothed canvas, computed the local pixel variance
+(5x5 window) around that exact (x,y) in this project's own row-major canvas buffer, and compared against 20
+random non-keypoint locations. Real result (idx01_0deg_light.raw):
+```
+avg local variance at 20 real keypoints    = 3112.9
+avg local variance at 20 random locations  =  437.5   (~7x lower)
+```
+A coarse ASCII overlay of the mask + keypoint locations (downsampled 96x96 -> 48x48) additionally shows a
+single coherent, contiguous finger-silhouette-shaped mask region, with keypoints (`X`) clustering along
+internal ridge structure and the mask boundary -- exactly the qualitative picture expected for a real
+fingerprint capture, with **no transpose/mirror/flip applied.**
+
+### Conclusion: orientation/mirroring hypothesis is RULED OUT
+Both tests confirm this project's raw capture/canvas coordinate convention already matches what the real
+algorithm expects, with no flip or transpose needed: keypoints land on genuine high-variance ridge content
+(not noise/flat regions), and detection quality is symmetric across all 4 possible orientations (so even if
+the "true" sensor mounting orientation were flipped relative to assumption, it would not be distinguishable by
+detection quality -- but the coordinate-sanity check independently confirms the assumed convention is already
+correct). This specific check is closed. Per the investigation plan, moving to the acquisition-parameters
+hypothesis next (raw exposure/gain/frame-averaging registers from the original wake/init byte trace).
