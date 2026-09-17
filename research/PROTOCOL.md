@@ -4448,3 +4448,62 @@ evidence this project cannot generate by continuing to introspect the same `.so`
 real Windows driver's traffic to the sensor (to check for firmware-level image conditioning or an entirely
 different acquisition sequence never exposed to this Linux `.so`), or acceptance that this is a genuine,
 now extremely well-evidenced viability limit for this specific `.so` on Linux.
+
+## Real Windows driver USB capture -- VM passthrough setup and a new finding: alternating touch/background frames during verify (2026-09-17)
+
+### Setup
+Built a libvirt/QEMU Windows 11 VM (`win11-fpsensor`, UEFI+Secure Boot via OVMF, TPM 2.0 via swtpm) on the same
+Arch Linux host as this whole project, and passed the physical FocalTech sensor (`2808:a658`) through to it via
+QEMU's `usb-host` USB-device-level passthrough (NOT PCI/VFIO -- the sensor shares an IOMMU group with the
+laptop's entire internal USB controller, which also serves the webcam/Bluetooth/WWAN modem, making full
+PCI passthrough impractical; USB-device-level passthrough sidesteps this entirely and leaves the rest of the
+host's USB devices untouched). Installed the real ASUS/FocalTech Windows driver package (model S3402ZA/K3402ZA)
+inside the VM, enrolled a real finger via Windows Hello, and did several verify/unlock attempts.
+
+Critically: since `usb-host` passthrough proxies real URBs through the host's own USB stack (unlike PCI/VFIO,
+which would remove the device from host visibility entirely), the REAL USB traffic between the real Windows
+driver and the real sensor is visible on the HOST via Linux's `usbmon` -- captured with
+`tshark -i usbmon3 -w enroll_capture.pcapng` for the whole enroll+verify session (17284 packets, 112s).
+
+### Traffic shape (confirms this project's own protocol RE)
+12834/12840 packets for the sensor's device address were bulk transfers (only 6 control transfers) -- the real
+Windows driver uses the same predominantly-bulk-transfer protocol this project independently reverse-engineered
+from scratch (`tools/rts5811_wake_test.c`). Small transfer sizes (2-24 bytes) match the confirmed
+SRAM-register-read/write command structure. 32 transfers were exactly 10240 bytes -- the exact 80x64x2 raw
+frame size this project has used throughout, confirming the raw capture format/size itself was never the gap.
+
+### NEW FINDING: enrollment vs. verify use genuinely different acquisition patterns
+Extracted all 32 raw 10240-byte frames (`research/captures/windows_usb_capture/raw_frames/`) and inspected them
+both numerically (mean absolute pixel difference between consecutive frames) and visually (rendered to PNG,
+percentile-normalized, same convention as this project's own tooling).
+
+- **Frames 1-18 (initial enrollment burst, one touch every ~0.5-1.3s):** every single frame shows genuine,
+  clear fingerprint ridge structure. No alternation, no blank frames. This matches exactly what this project's
+  own `rts5811_wake_test.c`-captured datasets have always looked like -- enrollment-time raw acquisition is NOT
+  where the gap is.
+- **Frames 19-32 (a later segment ~19s after enrollment ended, corresponding to verify/unlock attempts):**
+  frames cleanly ALTERNATE between two distinct kinds of image, confirmed visually across 4 consecutive samples
+  (frames 19/20/21/22):
+  - Odd-position frames: genuine fingerprint ridge structure, avg pixel value ~2045-2260
+  - Even-position frames (each ~0.4-0.8s after its preceding odd frame): almost no ridge structure at all --
+    a faint, mostly-featureless smudge, avg pixel value ~2585-2625
+  This pattern is clean and consistent, not incidental noise -- it strongly suggests the real Windows
+  driver/firmware captures a background/reference frame immediately after (or interleaved with) every actual
+  verify touch, which this project's own capture and ground-truth-extraction tooling has NEVER done (DAC
+  calibration is run once up front; every subsequent touch capture is a single raw frame with no companion
+  background read at all).
+
+### Significance
+This is a genuine, well-evidenced, driver-level acquisition-sequence difference that lives OUTSIDE the
+`FtAlg`/`FtGetTemplate*` algorithm functions already thoroughly explored inside `libfprint-2.so.2.0.0` -- it
+was invisible to the earlier DWARF/symbol-search-based "acquisition parameters hypothesis" check (which only
+searched for exposure/gain/frame-averaging FUNCTIONS inside the algorithm library, not the driver's actual
+wire-level capture SEQUENCE). It also reveals a real asymmetry this project's own testing has never replicated:
+if verify-time matching is normally done against a background-subtracted probe image while this project has
+only ever tested plain-image-to-plain-image comparisons, that alone could plausibly explain a meaningful
+fraction of the persistent non-separation result.
+
+Next: test directly -- background-subtract each verify-segment touch frame using its paired near-blank frame,
+run both the raw and background-subtracted versions through the real `.so` pipeline
+(`FtSegmentByLocalVariance`/`FtGetMfbFeatures`/`FtCalcSimScore`), and compare feature quality and same-finger
+matching scores.
