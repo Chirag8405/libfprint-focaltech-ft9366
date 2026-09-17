@@ -4580,3 +4580,141 @@ Windows-vs-Linux discrepancy, and the natural next step: locate and directly cal
 function (if one is separately exported/callable), or substantially harden this project's own alignment
 estimator (proper multi-seed RANSAC with inlier-count maximization rather than single greedy clique growth) and
 re-test.
+
+## Alignment/correspondence root-cause investigation: real candidate-generation formula found and confirmed live (2026-09-17)
+
+Status: CONFIRMED via a combination of raw disassembly (exact table values, hardcoded as hardcoded immediate
+byte stores, unambiguous) and live gdb register inspection with real templates (to resolve register-role
+ambiguity that pure static reading could not settle confidently).
+
+### STEP 1: what's already real vs. approximated, precisely
+Re-confirmed via `research/PROTOCOL.md`'s own prior entries (FtRansacAngle_32f disassembly, 2026-09-16): the
+DISTANCE-CONSISTENCY-GRAPH filtering this project's `ground_truth_calcsimscore_batch*.c` tools already use
+(`|distA - distB| < 2.0` pixels between candidate pairs, max-degree seed selection) is a FAITHFUL match to the
+real, confirmed `FtRansacAngle_32f` logic -- this part was never the gap. The actual, never-traced gap is
+EARLIER: the initial correspondence PROPOSAL step (deciding which (featureA, featureB) pairs are even offered
+as "candidates" before the consistency graph runs at all). This project has always substituted its own
+Hamming<=60 + ratio<=0.85 constant-threshold heuristic here, never a disassembled real function.
+
+### STEP 2: traced the real candidate-generation logic, found inline in FtVerifyTwoTemplate (not a separate call)
+No separate helper function is called for this step (`FtRecallBinCheck`/`FtCalcBinFeature`/`getLocalFeature`
+are all called elsewhere in `FtVerifyTwoTemplate`, but AFTER the RANSAC stages, not before -- ruled out as the
+candidate generator). The real logic is inlined directly in `FtVerifyTwoTemplate` (`FtAlg.c`, around file
+offset 0xc3d61-0xc3f6e), disassembled directly:
+
+For each feature in template A, it scans ALL features in template B computing the full 256-bit descriptor
+Hamming distance via a genuine byte-lookup-table popcount (table `invHMTableAlg`, 4 byte-lookups + adds per
+32-bit word, summed over the 8 words of `bDescri`) -- confirming this project's own `__builtin_popcount`-based
+Hamming computation is mathematically equivalent (same result, different implementation technique). It tracks
+the best (lowest) and prior-best ("second") distance in a single online pass (not a full sort), then applies a
+REAL, exact acceptance rule using a hardcoded 9-entry margin table (confirmed via raw immediate byte values in
+the disassembly at offsets 0x1e50-0x1e58, used when `gSensorInfor.setAlgMode==0`, the cold-load default):
+```
+marginTable = [64, 64, 64, 12, 8, 6, 3, 2, 1]   (indices 0-8)
+bucket = floor(secondBestDistance / 32), clamped to 8
+ACCEPT the candidate pair iff:  secondBestDistance - bestDistance > marginTable[bucket]
+```
+This margin SHRINKS as the raw distance grows (64 at very close matches, down to 1 near the maximum possible
+256-bit distance) -- a coherent design: demanding a large absolute uniqueness margin for high-confidence
+(low-distance) matches, while remaining satisfiable (not impossibly strict) for weaker matches near the
+distance ceiling. This is a real, qualitatively different rule from this project's fixed `ratio<=0.85` constant
+(which demands a CONSTANT proportional margin regardless of absolute distance).
+
+### Verification method: live gdb register inspection (not just static reading)
+Built `tools/ground_truth_verify_two_template.c` to call the real `FtGetTemplateForEnroll` (building two real
+templates from two real captures) then the real `FtVerifyTwoTemplate` directly. It crashes later in the
+function (`FtAlg.c:7268`, likely a NULL internal buffer this minimal harness doesn't populate -- not
+investigated further, not needed), but execution reaches the candidate-generation region cleanly beforehand.
+Set a breakpoint at the exact `cmp` instruction deciding accept/reject (offset `FtVerifyTwoTemplate+0x77e`) and
+captured real register values across 4 hits:
+```
+hit1: r11d=246 ebp=246 eax=244  -> reject (ebp not < eax)
+hit2: r11d=231 ebp=220 eax=229  -> accept (ebp < eax)
+hit3: r11d=215 ebp=211 eax=213  -> accept (ebp < eax; eax off by 1 from hand-computed 212 -- minor
+                                    discrepancy, unexplained, does not change the qualitative formula)
+hit4: r11d=245 ebp=227 eax=243  -> accept (ebp < eax)
+```
+This empirically confirmed the register roles are the OPPOSITE of the first static-reading guess: `ebp` is the
+true best (smaller) distance and `r11d` is the second-best/comparison value the margin table is bucketed on --
+resolving an ambiguity pure disassembly reading could not settle confidently. All 4 samples are consistent with
+the formula above (hit1 is the natural init-time edge case where both values start equal, correctly rejected).
+
+### STEP 3 (in progress): reimplement and re-test
+Next: replace this project's `ratio<=0.85` candidate rule with this exact confirmed formula in the ground-truth
+batch scoring tool, re-run against the 153-pair real Windows-captured same-finger dataset first to check
+whether `seedSetN` (and therefore score) improves, then re-run the full 190-pair separation test.
+
+## Alignment/correspondence root-cause investigation, STEP 3: naive port FAILED -- real mechanism is not nearest-neighbor matching at all (2026-09-17)
+
+Status: CONFIRMED via live gdb trace with real data (not guessed) that the real candidate-tracking
+loop's semantics are qualitatively different from a nearest-neighbor-with-ratio-test, contrary to this
+investigation's working hypothesis. Reporting honestly rather than continuing to force-fit the wrong model.
+
+### First attempt: naive port using a properly-sorted true best/second-best -- FAILED completely
+Implemented `tools/ground_truth_calcsimscore_batch_realcand.c`: same pipeline as the SPA variant, but replaced
+the candidate-acceptance rule with `secondBest - best > marginTable[floor(secondBest/32)]` using a PROPERLY
+SORTED true best/second-best Hamming distance (computed by scanning all of template B and tracking the true
+two smallest values). Result on the same 153-pair real Windows-captured same-finger dataset used throughout
+this investigation:
+```
+FAILED (too few candidates): n=153   (every single pair failed -- zero candidates survived for all 153 pairs)
+```
+This is a complete regression, not an improvement -- the real margin table applied to a properly-sorted
+best/second-best is far too strict to ever pass.
+
+### Root cause: traced live, the real loop does NOT track true best/second-best at all
+Built a python-scripted gdb trace (breakpoints at `FtVerifyTwoTemplate+0x722` and `+0x77e`, offsets relative to
+the function's real DWARF-resolved address so it survives ASLR/dlopen placement differences between runs) and
+captured the full, uninterrupted per-candidate update sequence for one template-A feature (i=3) against all 11
+template-B candidates it was compared against, with real Hamming distances `[133, 150, 121, 127, 91, 215, 211,
+129, 151, 126, 172]` (in scan order):
+```
+j=1  d=150 > prevBest(133)  -> "best"(r11w) BECOMES 150 (the WORSE value); "other"(ebp) stays 133
+j=2  d=121 <= r11w(150)     -> ebp = max(ebp=133, d=121) = 133 (unchanged); r11w unchanged=150
+j=3  d=127 <= r11w(150)     -> ebp = max(133,127) = 133 (unchanged); r11w unchanged
+j=4  d=91  <= r11w(150)     -> ebp = max(133,91)  = 133 (unchanged); r11w unchanged   <-- TRUE MINIMUM, but tracked state ignores it
+j=5  d=215 > r11w(150)      -> r11w BECOMES 215; ebp = old r11w = 150
+j=6  d=211 <= r11w(215)     -> ebp = max(150,211) = 211; r11w unchanged=215
+j=7  d=129 <= 215           -> ebp = max(211,129) = 211 (unchanged)
+j=8  d=151 <= 215           -> ebp = max(211,151) = 211 (unchanged)
+j=9  d=126 <= 215           -> ebp = max(211,126) = 211 (unchanged)
+j=10 d=172 <= 215           -> ebp = max(211,172) = 211 (unchanged)
+FINAL: r11w=215, ebp=211
+```
+This exact simulation matches the live-captured register trace at every single step (10/10). **The final
+tracked "r11w" (215) is nowhere close to the true minimum distance in the sequence (91, found at j=4) --
+the real loop's bookkeeping actively loses track of the true nearest neighbor.** Checked what candidate
+actually gets stored when accepted: the code dereferences a pointer (`r12`) that is only updated on the
+"d > r11w" branch (the branch that occurs at j=1 and j=5 in this example) -- meaning the stored correspondence
+pairs template-A feature i=3 with template-B's feature at **j=5 (distance 215)**, not j=4 (distance 91, the
+true best match). This is not a nearest-neighbor-with-ratio-test algorithm at all; it is some other heuristic
+(plausibly a performance-motivated early-divergence detector, or a completely different-purpose computation
+this investigation misidentified as candidate generation) that this investigation could not determine the true
+intent of within the scope of this session.
+
+### STEP 4 -- honest report
+Per the pre-registered decision tree: a real, separately-identifiable "candidate generation" code region WAS
+found and traced (not RANSAC's own internal logic -- it lives earlier, inline in `FtVerifyTwoTemplate`, before
+the confirmed-faithful `FtRansacAngle_32f` stage). However, its actual behavior is NOT what this investigation
+hypothesized (nearest-neighbor matching with a distance-dependent margin/ratio test) -- it tracks something
+else entirely, and does not reliably identify the true best-matching feature. The one fact that IS fully
+confirmed and unambiguous is the exact margin table `[64,64,64,12,8,6,3,2,1]` (hardcoded immediates, verified
+byte-for-byte from disassembly) -- but the surrounding control flow it's embedded in does not match this
+project's own (or any straightforward) nearest-neighbor reimplementation, and a naive port made results
+strictly worse (0/153 pairs scored at all, vs. this project's existing approximation's 0.9063 avg on the same
+data).
+
+**Conclusion: this specific lead does not resolve cleanly.** The alignment/correspondence step contains real,
+confirmed complexity beyond what a straightforward "port the real formula" fix can address within reasonable
+effort -- reimplementing it faithfully would require first determining the true algorithmic PURPOSE of this
+loop (which this session could not establish), not just its literal instruction-level behavior. This project's
+existing approximation (Hamming<=60 && ratio<=0.85, feeding the already-confirmed-faithful distance-consistency
+RANSAC stage) remains the best available candidate-generation stand-in; the seedSetN-vs-score correlation
+finding from the prior session remains a real, valid observation about THIS PROJECT'S OWN estimator's
+reliability, but the hypothesis that porting the exact real candidate-generation formula would fix it is NOT
+confirmed -- if anything, this session's evidence suggests the real formula alone (without correctly
+understanding its true structural role) is not a drop-in improvement.
+
+Reverted to the prior working formula for the shipped/tested tooling; `ground_truth_calcsimscore_batch_realcand.c`
+and `ground_truth_verify_two_template.c` are kept as historical diagnostic artifacts documenting this
+investigation, not as improvements to adopt going forward.
