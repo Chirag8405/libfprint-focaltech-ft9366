@@ -4892,3 +4892,57 @@ question from the immediately preceding investigation.
 3. Consider whether the ~230-310KB template blob size can be explained by a specific number of merged
    sub-samples (e.g. divide by a plausible per-sample size to estimate a merge count) as a next concrete,
    checkable detail.
+
+## MAJOR FINDING: real FtVerifyTwoTemplate pipeline structure recovered from Windows build's debug strings (2026-09-18)
+
+Status: CONFIRMED via x64dbg's "String references (All Modules)" search against the live, real
+`ftWbioEngineAdapter.dll` (v1.10.25.3521) inside the running `WbioSrvc` process. This build ships with a much
+richer internal logger (`"focaltech-lib: <level> %s: ..."`) than the `"[Engine] <level> ..."` layer already
+captured in the previous entry -- these are two DIFFERENT internal logging subsystems (engine-adapter-level vs.
+core-algorithm-library-level).
+
+### Real, complete FtVerifyTwoTemplate pipeline order (from format-string literals, in address order = likely execution order)
+```
+CalBoolDescriDist          -> logs "pointNum" (candidate count BEFORE ransac)
+FtRansacNew                -> logs "maxMatchNum" (in-ransac), then "m" (after ransac)
+foreignBody check          -> logs "m" (after foreignBody)
+BinCheck                   -> logs "m, uniformSize, overLapSize[0]" (after BinCheck)
+FtGetUniformRegSizeAll     -> (timing only logged)
+Recall (FtRecallBinCheck)  -> logs "m" (after Recall)
+                            -> final: "leave, mach score = %d"
+```
+This is a substantially more complete, real, NAMED pipeline than anything recovered from the Linux `.so`'s
+static disassembly across this entire project. In particular:
+- **`CalBoolDescriDist`** is almost certainly the real name of the candidate/correspondence Hamming-distance
+  step this project has spent the most effort on (previously only reachable via raw disassembly of an inlined,
+  unnamed code region in `FtVerifyTwoTemplate`).
+- **The real RANSAC function in THIS build is named `FtRansacNew`** -- NOT `FtRansacAngle_32f`/
+  `FtRansacEdage_32f` as found in the `.so` this project has been disassembling. This strongly suggests this
+  Windows build (v1.10.25.3521, 2018) may run a materially different/updated RANSAC implementation than
+  whatever specific `.so` build this project has had available on Linux -- a plausible, concrete explanation
+  for why static analysis of the `.so`'s RANSAC produced confusing/inconsistent results (the two builds may
+  simply implement this stage differently).
+- Confirms `FtRecallBinCheck` (long flagged "not traced" from `.so` analysis) is a real, distinct pipeline
+  stage ("Recall") that runs AFTER RANSAC and a "foreignBody"/"BinCheck" filtering stage, not before as this
+  project's own reimplementation's candidate-generation-then-RANSAC ordering assumed.
+- Confirms `FtGetUniformRegSizeAll` (previously "not traced" area/overlap weighting) runs between BinCheck and
+  Recall.
+- `FtVerifyByTemplate` (a higher-level caller) loops over subtemplates via `FtVerifySubTemplate`, tracking
+  `MaxMatchSccores`/`MatchIndex`/`MatchIndexSubTemplate` -- confirms the multi-subtemplate best-of-N mechanism
+  this project already tested (see much earlier PROTOCOL.md entries), now with real internal variable names.
+
+### Caveat: these specific strings did NOT appear in the previous entry's successful live trace
+The earlier full identify trace (previous PROTOCOL.md entry) captured extensive `"[Engine] ..."` output but
+NONE of these `"focaltech-lib: D/I/E ..."` lines, despite `alg->verify` definitely having executed (confirmed
+by the "MATCH"/successful identify outcome). This suggests the core-algorithm-library logger is gated to a
+higher minimum severity by default (e.g. only its "E"(error) level actually reaches `OutputDebugString`, with
+"D"(debug)/"I"(info)/"V"(verbose) compiled in but suppressed at runtime) -- not yet confirmed, next step is to
+check whether a breakpoint placed directly in this code path fires and can be inspected via registers even if
+the log strings themselves stay silent.
+
+### Located candidate real function entry point
+First code address referencing the string "FtVerifyTwoTemplate" (0x00007FF8BB1301A8 in this session's load, base
+`ftWbioEngineAdapter.dll` @ 00007FF8BB0A0000) is `00007FF8BB0C2782` -- offset `0x22782` from module base. This
+is very likely at or very near the real `FtVerifyTwoTemplate` function's entry (the first debug-log call
+inside it, checking `tempPointPos == NULL`). Next step: breakpoint here (recomputed relative to base on each
+fresh attach, since ASLR changes the load address every session) and inspect live during a real touch.
