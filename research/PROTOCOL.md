@@ -5009,3 +5009,38 @@ question needs to be re-aimed at whatever `alg->verify`/`0xAE030` actually calls
 2. Separately, consider triggering a real `WinBioVerify` (1:1, requires a specific `WINBIO_IDENTITY`) call to
    confirm whether `FtVerifyByTemplate`/`FtVerifyTwoTemplate` DOES fire for that API, which would confirm the
    "reserved for 1:1 verify" hypothesis directly rather than by elimination.
+
+## WinBioVerify (1:1) hypothesis test: inconclusive due to a real technical obstacle, not resolved either way (2026-09-18)
+
+Status: INCONCLUSIVE -- honestly reporting a blocker rather than a clean yes/no.
+
+### Attempted: construct a real WinBioVerify call to test whether FtVerifyByTemplate fires for 1:1 verify
+Built a `WINBIO_IDENTITY` structure matching Microsoft's documented layout exactly (confirmed via official docs,
+not guessed): `Type` (ULONG, offset 0) = `WINBIO_ID_TYPE_SID` (3), followed by a `Value.AccountSid` struct at
+offset 4 (`Size` ULONG at offset 4, `Data[68]` at offset 8, total struct size 76 bytes), populated with the
+real binary form of the test account's SID (`S-1-5-21-1995636576-3734506150-1536245802-1001`, obtained via
+`whoami /user`). Called `WinBioOpenSession` (succeeded, HRESULT 0) then `WinBioVerify` with `SubFactor =
+WINBIO_SUBTYPE_ANY` (0, a documented-valid value for this parameter).
+
+**Result: `WinBioVerify` returns `0x80070057` (E_INVALIDARG) immediately, every time, without ever blocking for
+a sensor touch.** This does not match the documented behavior (which should either succeed and block for a
+touch, or fail for a specific identifiable reason) -- the exact cause was not found despite the structure
+matching official documentation precisely. Possible untried causes: `WinBioVerifyWithCallback` may be required
+instead of the synchronous form for this pool type; a specific non-ANY subfactor (e.g. an
+`WINBIO_ANSI_381_POS_*` finger-position constant) may be required rather than `WINBIO_SUBTYPE_ANY`; or some
+other marshaling/environment detail specific to calling from a PowerShell console host process.
+
+### This is NOT the same as a confirmed "no" result
+This differs from a clean negative (breakpoints armed, real API call correctly reaches the sensor, functions
+don't fire) -- here the API call itself never validated successfully, so nothing about `FtVerifyByTemplate`'s
+real usage for 1:1 verify has actually been tested. This question remains genuinely open, separate from and
+not resolved by this attempt.
+
+### Decision: pivot to tracing alg->verify's real callees for the identify path instead
+Per the fallback identified in the previous entry's Step 3 contingency: continuing to fix this narrow
+WinBioVerify API-usage issue is deprioritized in favor of directly tracing what actually IS used by
+`WinBioIdentify` (the code path real-world Windows Hello login/unlock actually exercises) -- `alg->verify`'s own
+real callees (`0x0B43E0`, `0x0C4600`, `0x0C4D40`, `0x0C09B0`, `0x0C4D50`, `0x0BBDE0`, addresses from the
+current session's DLL load; recompute relative to module base on future sessions since ASLR changes the load
+address each time). This is valuable regardless of how the WinBioVerify question eventually resolves, since
+it's the mechanism real users' logins actually depend on.
