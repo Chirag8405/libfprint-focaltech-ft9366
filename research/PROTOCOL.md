@@ -4946,3 +4946,66 @@ First code address referencing the string "FtVerifyTwoTemplate" (0x00007FF8BB130
 is very likely at or very near the real `FtVerifyTwoTemplate` function's entry (the first debug-log call
 inside it, checking `tempPointPos == NULL`). Next step: breakpoint here (recomputed relative to base on each
 fresh attach, since ASLR changes the load address every session) and inspect live during a real touch.
+
+## Live-traced the real identify code path end-to-end: FtVerifyByTemplate/FtVerifyTwoTemplate is NOT used for identify (2026-09-18)
+
+Status: CONFIRMED via live breakpoint tracing through a complete, successful real identify operation (touch ->
+match -> dynamic template update -> full session teardown), using the same win11-fpsensor VM live-debugging
+setup as the previous entries.
+
+### Method
+Set a breakpoint at `common_identify`'s "call alg->verify." log site (`ftWbioEngineAdapter.dll+0x67E6` this
+session), confirmed it fires once per enrolled record (5 times, matching the previously-found record count).
+Stepped forward from there to find the actual call instruction: `call ftwbioengineadapter.7FF8BB0AE030`
+(sandwiched between two `GetTickCount()` calls used for the "KPI alg->verify used %d ms" timing log, with its
+return value directly feeding the match/fail decision) -- this is the real top-level per-record comparison
+function for the identify path. Set a second breakpoint there and inspected its entry: takes ~6 params
+(engine context in rcx, a quality-mode-related value in edx, a template pointer in r8/rdi, r9/r12, plus two
+stack-passed output pointers in r15/r13), immediately logs `"focaltech-lib: I %s: %s......quality=%d area=%d
+hum=%d"` and `"...filter_enhance_en = %d"`, then has an enhancement-retry branch logging `"...verify fail, need
+inhance image"` before calling further into functions at `0x0B43E0`, `0x0C4600`, `0x0C4D40`, `0x0C09B0`,
+`0x0C4D50`, `0x0BBDE0` (none of these addresses correspond to the previously-found `FtVerifyByTemplate`
+(~0x0C0EC8) or `FtVerifyTwoTemplate` (~0x0C1A8-ish) region).
+
+Set an additional breakpoint at `FtVerifyByTemplate`'s entry (`ftWbioEngineAdapter.dll+0x22EC8`, i.e. address
+`00007FF8BB0C0EC8` this session, near the first string reference to that function name) to test directly
+whether the identify path ever reaches it.
+
+### Result: watched all 5 records (4 failures + the 1 successful match) end-to-end -- FtVerifyByTemplate never fires
+```
+SubFactor 246: alg->verify (0xAE030) entered and returned -1 -- FtVerifyByTemplate breakpoint did NOT fire
+SubFactor 247: alg->verify (0xAE030) entered and returned -1 -- FtVerifyByTemplate breakpoint did NOT fire
+SubFactor 248: alg->verify (0xAE030) entered and returned -1 -- FtVerifyByTemplate breakpoint did NOT fire
+SubFactor 245: alg->verify (0xAE030) entered and returned  0 (MATCH) -- FtVerifyByTemplate breakpoint did NOT fire
+```
+Watched the successful (SubFactor 245) call all the way through to completion: `verify result: 0 update: 1` ->
+`MATCH` -> `identify total time` -> `dynamic_update_thread` (the adaptive template update from the earlier
+entry, confirmed again) -> `EngineAdapterIdentifyFeatureSet` completion -> full session teardown
+(`EngineAdapterDeactivate`, thread exits) -- all without ever hitting the `FtVerifyByTemplate` breakpoint, and
+without any `"focaltech-lib:"` debug string appearing at any point across all 5 records.
+
+### Conclusion
+**The entire `FtVerifyByTemplate` / `FtVerifyTwoTemplate` / `CalBoolDescriDist` / `FtRansacNew` pipeline
+recovered from this build's string table (previous entry) is NOT used by the `WinBioIdentify` (1:N identify)
+code path at all -- confirmed across all 5 enrolled records including the successful match, not just a sampled
+subset.** This pipeline is almost certainly reserved for the separate 1:1 `WinBioVerify` API (consistent with
+the distinct `"WINBIO_PURPOSE_VERIFY"` string found earlier, as opposed to `"WINBIO_PURPOSE_IDENTIFY"` which is
+what every trace this session has actually exercised). The REAL per-record comparison logic for identify lives
+inside `alg->verify` (`ftWbioEngineAdapter.dll` offset `0xAE030` this session) and its own distinct callees in
+the `0x0B4xxx`-`0x0Cxxxx` address range, under names not yet identified.
+
+### Implication for the whole correspondence-generation investigation
+The original static-analysis investigation (this project's Linux `.so` disassembly of `FtVerifyTwoTemplate`'s
+inline candidate-generation loop, and this session's live-debugging pivot) may have been reverse-engineering a
+function that the real Windows driver's default identify flow **does not even use**. This does not necessarily
+mean `FtVerifyTwoTemplate` is irrelevant (it may still be what a real 1:1 verify-by-identity call uses, or what
+this project's own reimplementation SHOULD be calling if it's trying to replicate 1:1 verification specifically
+rather than 1:N identify) -- but it means the specific "which candidate-generation formula does identify use"
+question needs to be re-aimed at whatever `alg->verify`/`0xAE030` actually calls, not at `FtVerifyTwoTemplate`.
+
+### Next steps
+1. Trace forward into `0xAE030`'s actual callees (`0x0B43E0`, `0x0C4600`, `0x0C4D40`, `0x0C09B0`, `0x0C4D50`,
+   `0x0BBDE0`) to find the real correspondence-generation/RANSAC-equivalent logic for the identify path.
+2. Separately, consider triggering a real `WinBioVerify` (1:1, requires a specific `WINBIO_IDENTITY`) call to
+   confirm whether `FtVerifyByTemplate`/`FtVerifyTwoTemplate` DOES fire for that API, which would confirm the
+   "reserved for 1:1 verify" hypothesis directly rather than by elimination.
